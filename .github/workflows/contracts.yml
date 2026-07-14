@@ -1,0 +1,270 @@
+name: Smart Contracts CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'contracts/**'
+      - '.github/workflows/contracts.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'contracts/**'
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint Rust Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      
+      - name: Run rustfmt
+        run: cargo fmt --manifest-path contracts/Cargo.toml -- --check
+      
+      - name: Run clippy
+        run: cargo clippy --manifest-path contracts/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+  test:
+    name: Test Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: contracts/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+      
+      - name: Run tests
+        run: cargo test --manifest-path contracts/Cargo.toml --release --verbose
+
+  build:
+    name: Build WASM Contracts
+    runs-on: ubuntu-latest
+    needs: [ lint, test ]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: contracts/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+      
+      - name: Build contracts
+        run: cargo build --manifest-path contracts/Cargo.toml --release --target wasm32-unknown-unknown
+      
+      - name: Verify WASM files
+        run: |
+          ls -lh contracts/target/wasm32-unknown-unknown/release/*.wasm
+          file contracts/target/wasm32-unknown-unknown/release/*.wasm
+      
+      - name: Calculate sizes
+        run: |
+          echo "## WASM Contract Sizes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for wasm in contracts/target/wasm32-unknown-unknown/release/*.wasm; do
+            size=$(ls -lh "$wasm" | awk '{print $5}')
+            name=$(basename "$wasm")
+            echo "- $name: $size" >> $GITHUB_STEP_SUMMARY
+          done
+      
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: wasm-contracts
+          path: contracts/target/wasm32-unknown-unknown/release/*.wasm
+          retention-days: 30
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      
+      - name: Run cargo-audit
+        run: cargo audit --manifest-path contracts/Cargo.toml
+
+  deploy-testnet:
+    name: Deploy to Testnet
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Soroban CLI
+        run: |
+          cargo install soroban-cli@latest
+      
+      - name: Download WASM artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: wasm-contracts
+          path: contracts/target/wasm32-unknown-unknown/release/
+      
+      - name: Configure Stellar Network
+        run: |
+          soroban network add \
+            --name testnet \
+            --rpc-url https://soroban-testnet.stellar.org \
+            --network-passphrase "Test SDF Network ; September 2015"
+      
+      - name: Deploy Contracts to Testnet
+        env:
+          ADMIN_SECRET_KEY: ${{ secrets.TESTNET_ADMIN_SECRET }}
+        run: |
+          echo "Deploying contracts to testnet..."
+          # Deploy scripts would go here
+          # For now, just verify the WASM files exist
+          ls -lh contracts/target/wasm32-unknown-unknown/release/*.wasm
+      
+      - name: Verify Testnet Deployment
+        run: |
+          echo "Testnet deployment verification would run here"
+          # Invoke test functions on contracts
+
+  deploy-mainnet:
+    name: Deploy to Mainnet
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: mainnet
+      url: https://stellar.expert/
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Soroban CLI
+        run: |
+          cargo install soroban-cli@latest
+      
+      - name: Download WASM artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: wasm-contracts
+          path: contracts/target/wasm32-unknown-unknown/release/
+      
+      - name: Configure Stellar Network
+        run: |
+          soroban network add \
+            --name mainnet \
+            --rpc-url https://soroban-mainnet.stellar.org \
+            --network-passphrase "Public Global Stellar Network ; September 2015"
+      
+      - name: Deploy Contracts to Mainnet
+        env:
+          ADMIN_SECRET_KEY: ${{ secrets.MAINNET_ADMIN_SECRET }}
+        run: |
+          echo "MAINNET DEPLOYMENT REQUIRES GOVERNANCE APPROVAL"
+          echo "Skipping automatic deployment - manual approval required"
+          ls -lh contracts/target/wasm32-unknown-unknown/release/*.wasm
+      
+      - name: Post Deployment Summary
+        run: |
+          echo "Mainnet deployment package ready"
+          echo "Contract hashes:"
+          sha256sum contracts/target/wasm32-unknown-unknown/release/*.wasm
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+      
+      - name: Generate coverage
+        run: cargo tarpaulin --manifest-path contracts/Cargo.toml --out Xml --exclude-files tests/
+      
+      - name: Upload to codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./cobertura.xml
+          fail_ci_if_error: false
+
+  documentation:
+    name: Generate Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      
+      - name: Generate docs
+        run: |
+          cargo doc --manifest-path contracts/Cargo.toml \
+            --no-deps \
+            --target wasm32-unknown-unknown \
+            --document-private-items
+      
+      - name: Upload docs
+        uses: actions/upload-artifact@v3
+        with:
+          name: rust-docs
+          path: contracts/target/wasm32-unknown-unknown/doc/
+          retention-days: 30

@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "carbon_registry",
+    "carbon_credit",
+    "carbon_marketplace",
+    "carbon_oracle",
+]
+resolver = "2"
