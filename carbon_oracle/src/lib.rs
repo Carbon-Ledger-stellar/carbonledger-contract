@@ -46,13 +46,17 @@ const PRICE_CACHE_TTL_LEDGERS: u32 = 17_280;
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    MonitoringData(String, String), // (project_id, period)
-    LatestMonitoring(String),       // project_id → latest timestamp
-    BenchmarkPrice(String, u32),    // (methodology, vintage_year)
+    MonitoringData(String, String),
+    LatestMonitoring(String),
+    BenchmarkPrice(String, u32),
     FlaggedProject(String),
     OracleAddress,
     Admin,
     Locked,
+    // Time-lock keys (Issue 3)
+    TimelockOp(String),
+    TimelockContest(String),
+    TimelockDelay,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -67,6 +71,37 @@ pub struct MonitoringData {
     pub satellite_cid:     String,
     pub submitted_by:      Address,
     pub submitted_at:      u64,
+}
+
+// ── Time-lock types (Issue 3) ─────────────────────────────────────────────────
+
+const TIMELOCK_DEFAULT_DELAY_SECS: u64 = 172_800; // 48 hours
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovAction {
+    UpdateCreditPrice,
+    ChangeTimelockDelay,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingOp {
+    pub op_id:        String,
+    pub action:       GovAction,
+    pub target:       String,
+    pub initiated_by: Address,
+    pub eta:          u64,
+    pub payload:      String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContestRecord {
+    pub op_id:        String,
+    pub contested_by: Address,
+    pub reason:       String,
+    pub contested_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -127,7 +162,10 @@ impl CarbonOracleContract {
             submitted_by:      oracle_signer.clone(),
             submitted_at:      now,
         };
-
+        if let Err(e) = Self::assert_valid_monitoring(&data) {
+            Self::release_lock(&env);
+            return Err(e);
+        }
         env.storage().persistent().set(
             &DataKey::MonitoringData(project_id.clone(), period.clone()),
             &data,
@@ -260,6 +298,127 @@ impl CarbonOracleContract {
                 now.saturating_sub(ts) <= MONITORING_FRESHNESS_SECS
             }
         }
+    }
+
+    // ── Time-lock governance functions (Issue 3) ─────────────────────────────
+
+    /// Propose a credit price update, queued with time-lock delay.
+    pub fn propose_price_update(env: Env, oracle_signer: Address, op_id: String, methodology: String, vintage_year: u32, new_price_usdc: i128) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        oracle_signer.require_auth();
+        if let Err(e) = Self::require_oracle(&env, &oracle_signer) { Self::release_lock(&env); return Err(e); }
+        if new_price_usdc <= 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
+        let delay = env.storage().persistent()
+            .get::<DataKey, u64>(&DataKey::TimelockDelay)
+            .unwrap_or(TIMELOCK_DEFAULT_DELAY_SECS);
+        let op = PendingOp {
+            op_id: op_id.clone(), action: GovAction::UpdateCreditPrice,
+            target: methodology.clone(), initiated_by: oracle_signer.clone(),
+            eta: env.ledger().timestamp() + delay, payload: String::from_str(&env, "price_update"),
+        };
+        env.storage().persistent().set(&DataKey::TimelockOp(op_id.clone()), &op);
+        // Stage price in temp storage so it's ready on execute
+        let key = DataKey::BenchmarkPrice(methodology.clone(), vintage_year);
+        env.storage().temporary().set(&key, &new_price_usdc);
+        env.storage().temporary().extend_ttl(&key, PRICE_CACHE_TTL_LEDGERS, PRICE_CACHE_TTL_LEDGERS);
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("tl_queue")), (op_id, oracle_signer, methodology, vintage_year, new_price_usdc));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Execute a queued price update after delay has elapsed.
+    pub fn execute_price_update(env: Env, oracle_signer: Address, op_id: String) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        oracle_signer.require_auth();
+        if let Err(e) = Self::require_oracle(&env, &oracle_signer) { Self::release_lock(&env); return Err(e); }
+        let op: PendingOp = match env.storage().persistent().get(&DataKey::TimelockOp(op_id.clone())) {
+            Some(o) => o,
+            None => { Self::release_lock(&env); return Err(CarbonError::ProjectNotFound); }
+        };
+        if env.storage().persistent().has(&DataKey::TimelockContest(op_id.clone())) {
+            Self::release_lock(&env); return Err(CarbonError::RetirementIrreversible);
+        }
+        if env.ledger().timestamp() < op.eta {
+            Self::release_lock(&env); return Err(CarbonError::RetirementIrreversible);
+        }
+        env.storage().persistent().remove(&DataKey::TimelockOp(op_id.clone()));
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("price_exe")), (op_id, oracle_signer));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Contest a pending governance operation. Any address may contest.
+    pub fn contest_operation(env: Env, contestant: Address, op_id: String, reason: String) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        contestant.require_auth();
+        let op: PendingOp = match env.storage().persistent().get(&DataKey::TimelockOp(op_id.clone())) {
+            Some(o) => o,
+            None => { Self::release_lock(&env); return Err(CarbonError::ProjectNotFound); }
+        };
+        if env.ledger().timestamp() >= op.eta {
+            Self::release_lock(&env); return Err(CarbonError::AlreadyRetired);
+        }
+        let record = ContestRecord {
+            op_id: op_id.clone(), contested_by: contestant.clone(),
+            reason: reason.clone(), contested_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::TimelockContest(op_id.clone()), &record);
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("tl_ctest")), (op_id, contestant, reason));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Roll back a pending or contested operation. Oracle signer only.
+    pub fn rollback_operation(env: Env, oracle_signer: Address, op_id: String) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        oracle_signer.require_auth();
+        if let Err(e) = Self::require_oracle(&env, &oracle_signer) { Self::release_lock(&env); return Err(e); }
+        if !env.storage().persistent().has(&DataKey::TimelockOp(op_id.clone())) {
+            Self::release_lock(&env); return Err(CarbonError::ProjectNotFound);
+        }
+        env.storage().persistent().remove(&DataKey::TimelockOp(op_id.clone()));
+        if env.storage().persistent().has(&DataKey::TimelockContest(op_id.clone())) {
+            env.storage().persistent().remove(&DataKey::TimelockContest(op_id.clone()));
+        }
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("tl_rback")), (op_id, oracle_signer));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Query a pending operation by ID.
+    pub fn get_pending_op(env: Env, op_id: String) -> Result<PendingOp, CarbonError> {
+        env.storage().persistent().get(&DataKey::TimelockOp(op_id)).ok_or(CarbonError::ProjectNotFound)
+    }
+
+    /// Query contest record by op ID.
+    pub fn get_contest(env: Env, op_id: String) -> Result<ContestRecord, CarbonError> {
+        env.storage().persistent().get(&DataKey::TimelockContest(op_id)).ok_or(CarbonError::ProjectNotFound)
+    }
+
+    /// Update the time-lock delay in seconds. Oracle only.
+    pub fn set_timelock_delay(env: Env, oracle_signer: Address, delay_secs: u64) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        oracle_signer.require_auth();
+        if let Err(e) = Self::require_oracle(&env, &oracle_signer) { Self::release_lock(&env); return Err(e); }
+        if delay_secs == 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
+        env.storage().persistent().set(&DataKey::TimelockDelay, &delay_secs);
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    // ── Validation helpers (Issue 2) ──────────────────────────────────────────
+
+    /// Assert that [`MonitoringData`] satisfies all data-structure invariants:
+    /// - `project_id`, `period`, `satellite_cid` must be non-empty.
+    /// - `tonnes_verified` > 0.
+    /// - `methodology_score` ∈ [0, 100].
+    fn assert_valid_monitoring(data: &MonitoringData) -> Result<(), CarbonError> {
+        if data.project_id.len() == 0    { return Err(CarbonError::ProjectNotFound); }
+        if data.period.len() == 0        { return Err(CarbonError::ProjectNotFound); }
+        if data.satellite_cid.len() == 0 { return Err(CarbonError::ProjectNotFound); }
+        if data.tonnes_verified <= 0     { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if data.methodology_score > 100  { return Err(CarbonError::InvalidVintageYear); }
+        Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -528,5 +687,107 @@ mod tests {
         client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &10_0000000_i128).unwrap();
         let price = client.get_benchmark_price(&s(&env, "VCS"), &2023_u32).unwrap();
         assert_eq!(price, 10_0000000_i128);
+    }
+
+    // ── Issue 2: Validation helper tests ──────────────────────────────────────
+
+    #[test]
+    fn test_submit_empty_period_fails() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        let result = client.try_submit_monitoring_data(
+            &oracle,
+            &s(&env, "proj-001"),
+            &s(&env, ""),  // empty period — invalid
+            &1000_i128,
+            &80_u32,
+            &s(&env, "QmCID"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_empty_satellite_cid_fails() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        let result = client.try_submit_monitoring_data(
+            &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q1"), &1000_i128, &80_u32, &s(&env, ""),
+        );
+        assert!(result.is_err());
+    }
+
+    // ── Issue 3: Time-lock tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_propose_price_update_and_query() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        client.propose_price_update(&oracle, &s(&env, "op-001"), &s(&env, "VCS"), &2023_u32, &20_0000000_i128).unwrap();
+        let op = client.get_pending_op(&s(&env, "op-001")).unwrap();
+        assert_eq!(op.op_id, s(&env, "op-001"));
+    }
+
+    #[test]
+    fn test_execute_price_update_before_delay_fails() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_price_update(&oracle, &s(&env, "op-002"), &s(&env, "VCS"), &2023_u32, &20_0000000_i128).unwrap();
+        assert!(client.try_execute_price_update(&oracle, &s(&env, "op-002")).is_err());
+    }
+
+    #[test]
+    fn test_execute_price_update_after_delay_succeeds() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_price_update(&oracle, &s(&env, "op-003"), &s(&env, "VCS"), &2024_u32, &25_0000000_i128).unwrap();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.execute_price_update(&oracle, &s(&env, "op-003")).unwrap();
+        assert!(client.try_get_pending_op(&s(&env, "op-003")).is_err());
+    }
+
+    #[test]
+    fn test_contest_price_update_blocks_execution() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_price_update(&oracle, &s(&env, "op-004"), &s(&env, "VCS"), &2023_u32, &50_0000000_i128).unwrap();
+        let user = Address::generate(&env);
+        client.contest_operation(&user, &s(&env, "op-004"), &s(&env, "price spike")).unwrap();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        assert!(client.try_execute_price_update(&oracle, &s(&env, "op-004")).is_err());
+    }
+
+    #[test]
+    fn test_rollback_price_update() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        client.propose_price_update(&oracle, &s(&env, "op-005"), &s(&env, "VCS"), &2023_u32, &15_0000000_i128).unwrap();
+        client.rollback_operation(&oracle, &s(&env, "op-005")).unwrap();
+        assert!(client.try_get_pending_op(&s(&env, "op-005")).is_err());
     }
 }

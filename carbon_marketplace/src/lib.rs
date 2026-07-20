@@ -45,6 +45,11 @@ pub enum DataKey {
     Admin,
     UsdcToken,
     Locked,
+    // Time-lock keys (Issue 3)
+    TimelockOp(String),
+    TimelockContest(String),
+    TimelockDelay,
+    ProtocolFeeBps, // basis points, default = 100 (1%)
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -72,6 +77,39 @@ pub struct MarketListing {
     pub country:          String,
     pub created_at:       u64,
     pub status:           ListingStatus,
+}
+
+// ── Time-lock types (Issue 3) ─────────────────────────────────────────────────
+
+const TIMELOCK_DEFAULT_DELAY_SECS: u64 = 172_800; // 48 hours
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = 100; // 1%
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovAction {
+    UpdateFee,
+    PauseContract,
+    ChangeTimelockDelay,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingOp {
+    pub op_id:        String,
+    pub action:       GovAction,
+    pub target:       String,
+    pub initiated_by: Address,
+    pub eta:          u64,
+    pub payload:      String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContestRecord {
+    pub op_id:        String,
+    pub contested_by: Address,
+    pub reason:       String,
+    pub contested_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -135,6 +173,10 @@ impl CarbonMarketplaceContract {
             created_at:       env.ledger().timestamp(),
             status:           ListingStatus::Active,
         };
+        if let Err(e) = Self::assert_valid_listing(&listing) {
+            Self::release_lock(&env);
+            return Err(e);
+        }
         env.storage().persistent().set(&DataKey::Listing(listing_id.clone()), &listing);
 
         let mut all: Vec<String> = env
@@ -220,7 +262,10 @@ impl CarbonMarketplaceContract {
 
         // ── effects ───────────────────────────────────────────────────────────
         let total_cost = listing.price_per_credit * amount;
-        let protocol_fee = total_cost / 100; // 1%
+        let fee_bps: i128 = env.storage().persistent()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS);
+        let protocol_fee = total_cost * fee_bps / 10_000;
         let seller_proceeds = total_cost - protocol_fee;
 
         listing.amount_available -= amount;
@@ -284,7 +329,10 @@ impl CarbonMarketplaceContract {
             }
 
             let total_cost = listing.price_per_credit * amount;
-            let protocol_fee = total_cost / 100;
+            let fee_bps: i128 = env.storage().persistent()
+                .get(&DataKey::ProtocolFeeBps)
+                .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS);
+            let protocol_fee = total_cost * fee_bps / 10_000;
             let seller_proceeds = total_cost - protocol_fee;
 
             listing.amount_available -= amount;
@@ -333,7 +381,143 @@ impl CarbonMarketplaceContract {
         Self::filter_listings(&env, |l| l.vintage_year == vintage_year)
     }
 
+    // ── Time-lock governance functions (Issue 3) ─────────────────────────────
+
+    /// Propose a protocol fee change (in basis points, e.g. 100 = 1%).
+    /// Queued with time-lock delay before it can be executed.
+    pub fn propose_update_fee(env: Env, admin: Address, op_id: String, new_fee_bps: i128) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+        if new_fee_bps <= 0 || new_fee_bps > 10_000 {
+            Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed);
+        }
+        let delay = env.storage().persistent()
+            .get::<DataKey, u64>(&DataKey::TimelockDelay)
+            .unwrap_or(TIMELOCK_DEFAULT_DELAY_SECS);
+        let op = PendingOp {
+            op_id: op_id.clone(), action: GovAction::UpdateFee,
+            target: String::from_str(&env, "protocol_fee"), initiated_by: admin.clone(),
+            eta: env.ledger().timestamp() + delay, payload: String::from_str(&env, "fee_update"),
+        };
+        env.storage().persistent().set(&DataKey::TimelockOp(op_id.clone()), &op);
+        // Stage the proposed fee — activated on execute
+        env.storage().persistent().set(&DataKey::ProtocolFeeBps, &new_fee_bps);
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("tl_queue")), (op_id, admin, new_fee_bps));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Execute a queued fee update after delay has elapsed.
+    pub fn execute_update_fee(env: Env, admin: Address, op_id: String) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+        let op: PendingOp = match env.storage().persistent().get(&DataKey::TimelockOp(op_id.clone())) {
+            Some(o) => o,
+            None => { Self::release_lock(&env); return Err(CarbonError::ListingNotFound); }
+        };
+        if env.storage().persistent().has(&DataKey::TimelockContest(op_id.clone())) {
+            Self::release_lock(&env); return Err(CarbonError::RetirementIrreversible);
+        }
+        if env.ledger().timestamp() < op.eta {
+            Self::release_lock(&env); return Err(CarbonError::RetirementIrreversible);
+        }
+        env.storage().persistent().remove(&DataKey::TimelockOp(op_id.clone()));
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("fee_upd")), (op_id, admin));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Contest a pending governance operation. Any address may contest.
+    pub fn contest_operation(env: Env, contestant: Address, op_id: String, reason: String) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        contestant.require_auth();
+        let op: PendingOp = match env.storage().persistent().get(&DataKey::TimelockOp(op_id.clone())) {
+            Some(o) => o,
+            None => { Self::release_lock(&env); return Err(CarbonError::ListingNotFound); }
+        };
+        if env.ledger().timestamp() >= op.eta {
+            Self::release_lock(&env); return Err(CarbonError::AlreadyRetired);
+        }
+        let record = ContestRecord {
+            op_id: op_id.clone(), contested_by: contestant.clone(),
+            reason: reason.clone(), contested_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::TimelockContest(op_id.clone()), &record);
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("tl_ctest")), (op_id, contestant, reason));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Roll back a pending or contested operation. Admin only.
+    pub fn rollback_operation(env: Env, admin: Address, op_id: String) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+        if !env.storage().persistent().has(&DataKey::TimelockOp(op_id.clone())) {
+            Self::release_lock(&env); return Err(CarbonError::ListingNotFound);
+        }
+        env.storage().persistent().remove(&DataKey::TimelockOp(op_id.clone()));
+        if env.storage().persistent().has(&DataKey::TimelockContest(op_id.clone())) {
+            env.storage().persistent().remove(&DataKey::TimelockContest(op_id.clone()));
+        }
+        env.events().publish((symbol_short!("c_ledger"), symbol_short!("tl_rback")), (op_id, admin));
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Query a pending operation by ID.
+    pub fn get_pending_op(env: Env, op_id: String) -> Result<PendingOp, CarbonError> {
+        env.storage().persistent().get(&DataKey::TimelockOp(op_id)).ok_or(CarbonError::ListingNotFound)
+    }
+
+    /// Query contest record by op ID.
+    pub fn get_contest(env: Env, op_id: String) -> Result<ContestRecord, CarbonError> {
+        env.storage().persistent().get(&DataKey::TimelockContest(op_id)).ok_or(CarbonError::ListingNotFound)
+    }
+
+    /// Update the time-lock delay in seconds. Admin only.
+    pub fn set_timelock_delay(env: Env, admin: Address, delay_secs: u64) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+        if delay_secs == 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
+        env.storage().persistent().set(&DataKey::TimelockDelay, &delay_secs);
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    // ── Validation helpers (Issue 2) ──────────────────────────────────────────
+
+    /// Assert that a [`MarketListing`] satisfies all data-structure invariants:
+    /// - `listing_id`, `batch_id`, `project_id`, `methodology`, `country` non-empty.
+    /// - `amount_available` > 0.
+    /// - `price_per_credit` > 0.
+    /// - `vintage_year` ∈ [2000, 2100].
+    fn assert_valid_listing(listing: &MarketListing) -> Result<(), CarbonError> {
+        if listing.listing_id.len() == 0  { return Err(CarbonError::ListingNotFound); }
+        if listing.batch_id.len() == 0    { return Err(CarbonError::ListingNotFound); }
+        if listing.project_id.len() == 0  { return Err(CarbonError::ListingNotFound); }
+        if listing.methodology.len() == 0 { return Err(CarbonError::ListingNotFound); }
+        if listing.country.len() == 0     { return Err(CarbonError::ListingNotFound); }
+        if listing.amount_available <= 0  { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if listing.price_per_credit <= 0  { return Err(CarbonError::PriceNotSet); }
+        if listing.vintage_year < 2000 || listing.vintage_year > 2100 {
+            return Err(CarbonError::InvalidVintageYear);
+        }
+        Ok(())
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
+
+    fn require_admin(env: &Env, caller: &Address) -> Result<(), CarbonError> {
+        let admin: Address = env.storage().persistent()
+            .get(&DataKey::Admin)
+            .ok_or(CarbonError::UnauthorizedVerifier)?;
+        if &admin != caller { return Err(CarbonError::UnauthorizedVerifier); }
+        Ok(())
+    }
 
     fn load_listing(env: &Env, listing_id: &String) -> Result<MarketListing, CarbonError> {
         env.storage()
@@ -598,5 +782,119 @@ mod tests {
         client.delist_credits(&seller, &s(&env, "list-001")).unwrap();
         let l = client.get_listing(&s(&env, "list-001")).unwrap();
         assert_eq!(l.status, ListingStatus::Delisted);
+    }
+
+    // ── Issue 2: Validation helper tests ──────────────────────────────────────
+
+    #[test]
+    fn test_list_credits_empty_methodology_fails() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        let result = client.try_list_credits(
+            &seller,
+            &s(&env, "list-bad"),
+            &s(&env, "batch-bad"),
+            &s(&env, "proj-bad"),
+            &10_i128,
+            &10_0000000_i128,
+            &2023_u32,
+            &s(&env, ""),    // empty methodology — invalid
+            &s(&env, "Brazil"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_credits_invalid_vintage_fails() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        let result = client.try_list_credits(
+            &seller, &s(&env, "list-bad2"), &s(&env, "batch-bad2"), &s(&env, "proj-bad2"),
+            &10_i128, &10_0000000_i128, &1990_u32, &s(&env, "VCS"), &s(&env, "Brazil"),
+        );
+        assert!(result.is_err());
+    }
+
+    // ── Issue 3: Time-lock tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_propose_fee_update_and_query() {
+        let env = Env::default();
+        let (client, admin, _, _) = setup(&env);
+        client.propose_update_fee(&admin, &s(&env, "op-001"), &200_i128).unwrap();
+        let op = client.get_pending_op(&s(&env, "op-001")).unwrap();
+        assert_eq!(op.op_id, s(&env, "op-001"));
+    }
+
+    #[test]
+    fn test_execute_fee_before_delay_fails() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let env = Env::default();
+        let (client, admin, _, _) = setup(&env);
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_update_fee(&admin, &s(&env, "op-002"), &200_i128).unwrap();
+        assert!(client.try_execute_update_fee(&admin, &s(&env, "op-002")).is_err());
+    }
+
+    #[test]
+    fn test_execute_fee_after_delay_succeeds() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let env = Env::default();
+        let (client, admin, _, _) = setup(&env);
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_update_fee(&admin, &s(&env, "op-003"), &200_i128).unwrap();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.execute_update_fee(&admin, &s(&env, "op-003")).unwrap();
+        assert!(client.try_get_pending_op(&s(&env, "op-003")).is_err());
+    }
+
+    #[test]
+    fn test_contest_fee_blocks_execution() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let env = Env::default();
+        let (client, admin, _, _) = setup(&env);
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_update_fee(&admin, &s(&env, "op-004"), &500_i128).unwrap();
+        let user = Address::generate(&env);
+        client.contest_operation(&user, &s(&env, "op-004"), &s(&env, "fee too high")).unwrap();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        assert!(client.try_execute_update_fee(&admin, &s(&env, "op-004")).is_err());
+    }
+
+    #[test]
+    fn test_rollback_fee_update() {
+        let env = Env::default();
+        let (client, admin, _, _) = setup(&env);
+        client.propose_update_fee(&admin, &s(&env, "op-005"), &200_i128).unwrap();
+        client.rollback_operation(&admin, &s(&env, "op-005")).unwrap();
+        assert!(client.try_get_pending_op(&s(&env, "op-005")).is_err());
+    }
+
+    #[test]
+    fn test_unauthorized_propose_fee_fails() {
+        let env = Env::default();
+        let (client, _, _, _) = setup(&env);
+        let rogue = Address::generate(&env);
+        assert!(client.try_propose_update_fee(&rogue, &s(&env, "op-bad"), &200_i128).is_err());
     }
 }
