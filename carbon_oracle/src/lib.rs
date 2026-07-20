@@ -127,7 +127,10 @@ impl CarbonOracleContract {
             submitted_by:      oracle_signer.clone(),
             submitted_at:      now,
         };
-
+        if let Err(e) = Self::assert_valid_monitoring(&data) {
+            Self::release_lock(&env);
+            return Err(e);
+        }
         env.storage().persistent().set(
             &DataKey::MonitoringData(project_id.clone(), period.clone()),
             &data,
@@ -260,6 +263,21 @@ impl CarbonOracleContract {
                 now.saturating_sub(ts) <= MONITORING_FRESHNESS_SECS
             }
         }
+    }
+
+    // ── Validation helpers (Issue 2) ──────────────────────────────────────────
+
+    /// Assert that [`MonitoringData`] satisfies all data-structure invariants:
+    /// - `project_id`, `period`, `satellite_cid` must be non-empty.
+    /// - `tonnes_verified` > 0.
+    /// - `methodology_score` ∈ [0, 100].
+    fn assert_valid_monitoring(data: &MonitoringData) -> Result<(), CarbonError> {
+        if data.project_id.len() == 0    { return Err(CarbonError::ProjectNotFound); }
+        if data.period.len() == 0        { return Err(CarbonError::ProjectNotFound); }
+        if data.satellite_cid.len() == 0 { return Err(CarbonError::ProjectNotFound); }
+        if data.tonnes_verified <= 0     { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if data.methodology_score > 100  { return Err(CarbonError::InvalidVintageYear); }
+        Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -528,5 +546,37 @@ mod tests {
         client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &10_0000000_i128).unwrap();
         let price = client.get_benchmark_price(&s(&env, "VCS"), &2023_u32).unwrap();
         assert_eq!(price, 10_0000000_i128);
+    }
+
+    // ── Issue 2: Validation helper tests ──────────────────────────────────────
+
+    #[test]
+    fn test_submit_empty_period_fails() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        let result = client.try_submit_monitoring_data(
+            &oracle,
+            &s(&env, "proj-001"),
+            &s(&env, ""),  // empty period — invalid
+            &1000_i128,
+            &80_u32,
+            &s(&env, "QmCID"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_submit_empty_satellite_cid_fails() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        let result = client.try_submit_monitoring_data(
+            &oracle,
+            &s(&env, "proj-001"),
+            &s(&env, "2023-Q1"),
+            &1000_i128,
+            &80_u32,
+            &s(&env, ""),  // empty CID — invalid
+        );
+        assert!(result.is_err());
     }
 }

@@ -181,6 +181,7 @@ impl CarbonCreditContract {
             status:       CreditStatus::Active,
             metadata_cid: metadata_cid.clone(),
         };
+        if let Err(e) = Self::assert_valid_batch(&batch) { Self::release_lock(&env); return Err(e); }
         env.storage().persistent().set(&DataKey::Batch(batch_id.clone()), &batch);
 
         // Append to project batch index
@@ -278,6 +279,7 @@ impl CarbonCreditContract {
             retired_at:        env.ledger().timestamp(),
             tx_hash:           tx_hash.clone(),
         };
+        if let Err(e) = Self::assert_valid_retirement(&cert) { Self::release_lock(&env); return Err(e); }
         env.storage().persistent().set(&DataKey::Retirement(retirement_id.clone()), &cert);
 
         // ── interactions ──────────────────────────────────────────────────────
@@ -364,6 +366,45 @@ impl CarbonCreditContract {
             }
         }
         result
+    }
+
+    // ── Validation helpers (Issue 2) ──────────────────────────────────────────
+
+    /// Assert that a [`CreditBatch`] satisfies all data-structure invariants:
+    /// - `batch_id`, `project_id`, `metadata_cid` must be non-empty.
+    /// - `amount` > 0.
+    /// - `vintage_year` ∈ [2000, 2100].
+    /// - `serial_end` ≥ `serial_start`.
+    /// - `serial_end - serial_start + 1` equals `amount` (serial range matches amount).
+    fn assert_valid_batch(batch: &CreditBatch) -> Result<(), CarbonError> {
+        if batch.batch_id.len() == 0     { return Err(CarbonError::SerialNumberConflict); }
+        if batch.project_id.len() == 0   { return Err(CarbonError::ProjectNotFound); }
+        if batch.metadata_cid.len() == 0 { return Err(CarbonError::ProjectNotFound); }
+        if batch.amount <= 0             { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if batch.vintage_year < 2000 || batch.vintage_year > 2100 {
+            return Err(CarbonError::InvalidVintageYear);
+        }
+        if batch.serial_end < batch.serial_start { return Err(CarbonError::InvalidSerialRange); }
+        let range_len = (batch.serial_end - batch.serial_start + 1) as i128;
+        if range_len != batch.amount { return Err(CarbonError::InvalidSerialRange); }
+        Ok(())
+    }
+
+    /// Assert that a [`RetirementCertificate`] satisfies all invariants:
+    /// - `retirement_id`, `credit_batch_id`, `project_id`, `tx_hash` non-empty.
+    /// - `amount` > 0.
+    /// - `serial_numbers` non-empty and count matches `amount`.
+    fn assert_valid_retirement(cert: &RetirementCertificate) -> Result<(), CarbonError> {
+        if cert.retirement_id.len() == 0   { return Err(CarbonError::ProjectNotFound); }
+        if cert.credit_batch_id.len() == 0 { return Err(CarbonError::ProjectNotFound); }
+        if cert.project_id.len() == 0      { return Err(CarbonError::ProjectNotFound); }
+        if cert.tx_hash.len() == 0         { return Err(CarbonError::ProjectNotFound); }
+        if cert.amount <= 0                { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if cert.serial_numbers.len() == 0  { return Err(CarbonError::InvalidSerialRange); }
+        if cert.serial_numbers.len() as i128 != cert.amount {
+            return Err(CarbonError::InvalidSerialRange);
+        }
+        Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -748,5 +789,54 @@ mod tests {
         let _ = c.try_mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &201_u64, &300_u64, &s(&env, "cid"));
         // New batch on free range must succeed (lock released)
         c.mint_credits(&admin, &s(&env, "p1"), &50_i128, &2023_u32, &s(&env, "b3"), &201_u64, &250_u64, &s(&env, "cid")).unwrap();
+    }
+
+    // ── Issue 2: Validation helper tests ──────────────────────────────────────
+
+    #[test]
+    fn test_mint_mismatched_serial_range_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin    = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(&env, &id);
+        c.initialize(&admin, &registry).unwrap();
+
+        // amount=100 but serial range 1..=50 — only 50 serials, mismatch
+        let result = c.try_mint_credits(
+            &admin,
+            &s(&env, "p1"),
+            &100_i128,
+            &2023_u32,
+            &s(&env, "b-mismatch"),
+            &1_u64,
+            &50_u64,
+            &s(&env, "cid"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mint_empty_metadata_cid_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin    = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(&env, &id);
+        c.initialize(&admin, &registry).unwrap();
+
+        let result = c.try_mint_credits(
+            &admin,
+            &s(&env, "p1"),
+            &100_i128,
+            &2023_u32,
+            &s(&env, "b-empty-cid"),
+            &1_u64,
+            &100_u64,
+            &s(&env, ""),  // empty CID — invalid
+        );
+        assert!(result.is_err());
     }
 }
