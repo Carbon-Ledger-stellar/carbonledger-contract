@@ -31,6 +31,7 @@ pub enum CarbonError {
     ProjectAlreadyExists  = 17,
     InvalidSerialRange    = 18,
     AlreadyInitialized    = 19,
+    ReentrancyGuard       = 20,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ pub enum DataKey {
     Verifiers,
     OracleAddress,
     RegistryAdmin,
+    Locked,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -118,13 +120,16 @@ impl CarbonRegistryContract {
         vintage_year: u32,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         if env.storage().persistent().has(&DataKey::Project(project_id.clone())) {
+            Self::release_lock(&env);
             return Err(CarbonError::ProjectAlreadyExists);
         }
         if vintage_year < 2000 || vintage_year > 2100 {
+            Self::release_lock(&env);
             return Err(CarbonError::InvalidVintageYear);
         }
 
@@ -149,6 +154,7 @@ impl CarbonRegistryContract {
             (symbol_short!("c_ledger"), symbol_short!("reg_proj")),
             (project_id, methodology, country, vintage_year),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -164,10 +170,14 @@ impl CarbonRegistryContract {
         project_id: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         verifier_address.require_auth();
         Self::require_verifier(&env, &verifier_address)?;
 
-        let mut project = Self::load_project(&env, &project_id)?;
+        let mut project = match Self::load_project(&env, &project_id) {
+            Ok(p) => p,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
 
         // ── effects ───────────────────────────────────────────────────────────
         project.status = ProjectStatus::Verified;
@@ -177,6 +187,7 @@ impl CarbonRegistryContract {
             (symbol_short!("c_ledger"), symbol_short!("verified")),
             (project_id, verifier_address),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -192,10 +203,14 @@ impl CarbonRegistryContract {
         reason: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         verifier_address.require_auth();
         Self::require_verifier(&env, &verifier_address)?;
 
-        let mut project = Self::load_project(&env, &project_id)?;
+        let mut project = match Self::load_project(&env, &project_id) {
+            Ok(p) => p,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
 
         // ── effects ───────────────────────────────────────────────────────────
         project.status = ProjectStatus::Rejected;
@@ -205,6 +220,7 @@ impl CarbonRegistryContract {
             (symbol_short!("c_ledger"), symbol_short!("rejected")),
             (project_id, verifier_address, reason),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -220,10 +236,14 @@ impl CarbonRegistryContract {
         status: ProjectStatus,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         oracle_address.require_auth();
         Self::require_oracle(&env, &oracle_address)?;
 
-        let mut project = Self::load_project(&env, &project_id)?;
+        let mut project = match Self::load_project(&env, &project_id) {
+            Ok(p) => p,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
 
         // ── effects ───────────────────────────────────────────────────────────
         project.status = status.clone();
@@ -233,6 +253,7 @@ impl CarbonRegistryContract {
             (symbol_short!("c_ledger"), symbol_short!("st_update")),
             (project_id, oracle_address),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -247,10 +268,14 @@ impl CarbonRegistryContract {
         reason: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
-        let mut project = Self::load_project(&env, &project_id)?;
+        let mut project = match Self::load_project(&env, &project_id) {
+            Ok(p) => p,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
 
         // ── effects ───────────────────────────────────────────────────────────
         project.status = ProjectStatus::Suspended;
@@ -260,6 +285,7 @@ impl CarbonRegistryContract {
             (symbol_short!("c_ledger"), symbol_short!("suspended")),
             (project_id, admin, reason),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -278,11 +304,16 @@ impl CarbonRegistryContract {
         project_id: String,
         amount: i128,
     ) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
         oracle_address.require_auth();
         Self::require_oracle(&env, &oracle_address)?;
-        let mut project = Self::load_project(&env, &project_id)?;
+        let mut project = match Self::load_project(&env, &project_id) {
+            Ok(p) => p,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
         project.total_credits_issued += amount;
         env.storage().persistent().set(&DataKey::Project(project_id), &project);
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -329,6 +360,24 @@ impl CarbonRegistryContract {
             return Err(CarbonError::UnauthorizedOracle);
         }
         Ok(())
+    }
+
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    /// Acquire the reentrancy lock. Returns [`CarbonError::ReentrancyGuard`] if
+    /// the contract is already executing a state-mutating function.
+    fn acquire_lock(env: &Env) -> Result<(), CarbonError> {
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::Locked).unwrap_or(false) {
+            return Err(CarbonError::ReentrancyGuard);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    /// Release the reentrancy lock. Must be called at the end of every
+    /// state-mutating function that called `acquire_lock`.
+    fn release_lock(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
     }
 }
 
@@ -494,5 +543,140 @@ mod tests {
         client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
         let result = client.try_initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
         assert!(result.is_err());
+    }
+
+    // ── Reentrancy guard tests ─────────────────────────────────────────────────
+
+    /// After a successful call the lock must be released (next call succeeds).
+    #[test]
+    fn test_lock_released_after_register_project() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+
+        // First call succeeds
+        client.register_project(
+            &admin,
+            &make_str(&env, "p1"),
+            &make_str(&env, "Proj1"),
+            &make_str(&env, "cid1"),
+            &Address::generate(&env),
+            &make_str(&env, "VCS"),
+            &make_str(&env, "Brazil"),
+            &make_str(&env, "forestry"),
+            &2023_u32,
+        ).unwrap();
+
+        // Second call on a different project_id also succeeds (lock was released)
+        client.register_project(
+            &admin,
+            &make_str(&env, "p2"),
+            &make_str(&env, "Proj2"),
+            &make_str(&env, "cid2"),
+            &Address::generate(&env),
+            &make_str(&env, "VCS"),
+            &make_str(&env, "Brazil"),
+            &make_str(&env, "forestry"),
+            &2024_u32,
+        ).unwrap();
+
+        let p = client.get_project(&make_str(&env, "p2")).unwrap();
+        assert_eq!(p.status, ProjectStatus::Pending);
+    }
+
+    /// Lock is released even when register_project returns an error (duplicate).
+    #[test]
+    fn test_lock_released_after_failed_register() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+
+        register(&env, &client, &admin);
+        // Duplicate — should fail but release the lock
+        let _ = client.try_register_project(
+            &admin,
+            &make_str(&env, "proj-001"),
+            &make_str(&env, "Dup"),
+            &make_str(&env, "cid"),
+            &Address::generate(&env),
+            &make_str(&env, "VCS"),
+            &make_str(&env, "Brazil"),
+            &make_str(&env, "forestry"),
+            &2023_u32,
+        );
+
+        // A fresh project_id must succeed (lock released)
+        client.register_project(
+            &admin,
+            &make_str(&env, "proj-002"),
+            &make_str(&env, "Another"),
+            &make_str(&env, "cid2"),
+            &Address::generate(&env),
+            &make_str(&env, "VCS"),
+            &make_str(&env, "Brazil"),
+            &make_str(&env, "forestry"),
+            &2024_u32,
+        ).unwrap();
+    }
+
+    /// Lock is released after verify_project succeeds.
+    #[test]
+    fn test_lock_released_after_verify_project() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+
+        register(&env, &client, &admin);
+        client.verify_project(&verifier, &make_str(&env, "proj-001")).unwrap();
+
+        // Suspend must succeed, proving the lock was released by verify_project
+        client.suspend_project(&admin, &make_str(&env, "proj-001"), &make_str(&env, "audit")).unwrap();
+        let p = client.get_project(&make_str(&env, "proj-001")).unwrap();
+        assert_eq!(p.status, ProjectStatus::Suspended);
+    }
+
+    /// Lock is released after suspend_project succeeds.
+    #[test]
+    fn test_lock_released_after_suspend_project() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+
+        register(&env, &client, &admin);
+        client.suspend_project(&admin, &make_str(&env, "proj-001"), &make_str(&env, "fraud")).unwrap();
+
+        // update_project_status must succeed (lock released)
+        client.update_project_status(&oracle, &make_str(&env, "proj-001"), &ProjectStatus::Completed).unwrap();
+        let p = client.get_project(&make_str(&env, "proj-001")).unwrap();
+        assert_eq!(p.status, ProjectStatus::Completed);
+    }
+
+    /// Lock is released after reject_project succeeds.
+    #[test]
+    fn test_lock_released_after_reject_project() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+
+        register(&env, &client, &admin);
+        client.reject_project(&verifier, &make_str(&env, "proj-001"), &make_str(&env, "fraud")).unwrap();
+
+        // Register a new project — lock must be free
+        client.register_project(
+            &admin,
+            &make_str(&env, "proj-new"),
+            &make_str(&env, "New"),
+            &make_str(&env, "cid"),
+            &Address::generate(&env),
+            &make_str(&env, "VCS"),
+            &make_str(&env, "Brazil"),
+            &make_str(&env, "forestry"),
+            &2025_u32,
+        ).unwrap();
     }
 }
