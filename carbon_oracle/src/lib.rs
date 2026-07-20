@@ -31,6 +31,7 @@ pub enum CarbonError {
     ProjectAlreadyExists   = 17,
     InvalidSerialRange     = 18,
     AlreadyInitialized     = 19,
+    ReentrancyGuard        = 20,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -51,6 +52,7 @@ pub enum DataKey {
     FlaggedProject(String),
     OracleAddress,
     Admin,
+    Locked,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -103,10 +105,14 @@ impl CarbonOracleContract {
         satellite_cid: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         oracle_signer.require_auth();
-        Self::require_oracle(&env, &oracle_signer)?;
+        if let Err(e) = Self::require_oracle(&env, &oracle_signer) {
+            Self::release_lock(&env); return Err(e);
+        }
 
         if tonnes_verified <= 0 {
+            Self::release_lock(&env);
             return Err(CarbonError::ZeroAmountNotAllowed);
         }
 
@@ -126,7 +132,6 @@ impl CarbonOracleContract {
             &DataKey::MonitoringData(project_id.clone(), period.clone()),
             &data,
         );
-        // Track latest submission timestamp for freshness checks
         env.storage().persistent().set(&DataKey::LatestMonitoring(project_id.clone()), &now);
 
         if methodology_score < 70 {
@@ -140,6 +145,7 @@ impl CarbonOracleContract {
             (symbol_short!("c_ledger"), symbol_short!("mon_data")),
             (project_id, period, tonnes_verified, methodology_score),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -156,10 +162,14 @@ impl CarbonOracleContract {
         price_usdc: i128,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         oracle_signer.require_auth();
-        Self::require_oracle(&env, &oracle_signer)?;
+        if let Err(e) = Self::require_oracle(&env, &oracle_signer) {
+            Self::release_lock(&env); return Err(e);
+        }
 
         if price_usdc <= 0 {
+            Self::release_lock(&env);
             return Err(CarbonError::ZeroAmountNotAllowed);
         }
 
@@ -172,6 +182,7 @@ impl CarbonOracleContract {
             (symbol_short!("c_ledger"), symbol_short!("price_upd")),
             (methodology, vintage_year, price_usdc),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -217,8 +228,11 @@ impl CarbonOracleContract {
         reason: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         oracle_signer.require_auth();
-        Self::require_oracle(&env, &oracle_signer)?;
+        if let Err(e) = Self::require_oracle(&env, &oracle_signer) {
+            Self::release_lock(&env); return Err(e);
+        }
 
         // ── effects ───────────────────────────────────────────────────────────
         env.storage().persistent().set(&DataKey::FlaggedProject(project_id.clone()), &reason);
@@ -227,6 +241,7 @@ impl CarbonOracleContract {
             (symbol_short!("c_ledger"), symbol_short!("flagged")),
             (project_id, oracle_signer, reason),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -259,6 +274,20 @@ impl CarbonOracleContract {
             return Err(CarbonError::UnauthorizedOracle);
         }
         Ok(())
+    }
+
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    fn acquire_lock(env: &Env) -> Result<(), CarbonError> {
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::Locked).unwrap_or(false) {
+            return Err(CarbonError::ReentrancyGuard);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    fn release_lock(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
     }
 }
 
@@ -413,5 +442,91 @@ mod tests {
         client.initialize(&admin, &oracle).unwrap();
         let result = client.try_initialize(&admin, &oracle);
         assert!(result.is_err());
+    }
+
+    // ── Reentrancy guard tests ─────────────────────────────────────────────────
+
+    /// Lock is released after submit_monitoring_data succeeds; a second call works.
+    #[test]
+    fn test_lock_released_after_submit_monitoring() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+
+        client.submit_monitoring_data(
+            &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q1"),
+            &5000_i128, &85_u32, &s(&env, "QmCID1"),
+        ).unwrap();
+
+        // Second call with different period — lock must be free
+        client.submit_monitoring_data(
+            &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q2"),
+            &4000_i128, &80_u32, &s(&env, "QmCID2"),
+        ).unwrap();
+
+        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q2")).unwrap();
+        assert_eq!(data.tonnes_verified, 4000);
+    }
+
+    /// Lock is released after update_credit_price succeeds.
+    #[test]
+    fn test_lock_released_after_update_price() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+
+        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &15_0000000_i128).unwrap();
+        // Second price update for different vintage — lock must be free
+        client.update_credit_price(&oracle, &s(&env, "VCS"), &2024_u32, &20_0000000_i128).unwrap();
+
+        let price = client.get_benchmark_price(&s(&env, "VCS"), &2024_u32).unwrap();
+        assert_eq!(price, 20_0000000_i128);
+    }
+
+    /// Lock is released after flag_project succeeds.
+    #[test]
+    fn test_lock_released_after_flag_project() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+
+        client.flag_project(&oracle, &s(&env, "proj-001"), &s(&env, "contradiction")).unwrap();
+        // Second flag on different project — lock must be free
+        client.flag_project(&oracle, &s(&env, "proj-002"), &s(&env, "double-count")).unwrap();
+    }
+
+    /// Lock is released after a failed submit (zero tonnes).
+    #[test]
+    fn test_lock_released_after_failed_submit() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+
+        // Zero tonnes — should fail and release lock
+        let _ = client.try_submit_monitoring_data(
+            &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q1"),
+            &0_i128, &80_u32, &s(&env, "QmCID"),
+        );
+
+        // Valid call must succeed (lock released)
+        client.submit_monitoring_data(
+            &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q1"),
+            &1000_i128, &80_u32, &s(&env, "QmCID"),
+        ).unwrap();
+
+        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q1")).unwrap();
+        assert_eq!(data.tonnes_verified, 1000);
+    }
+
+    /// Lock is released after a failed price update (unauthorized oracle).
+    #[test]
+    fn test_lock_released_after_failed_price_update() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+
+        let rogue = Address::generate(&env);
+        // Unauthorized — should fail and release lock
+        let _ = client.try_update_credit_price(&rogue, &s(&env, "VCS"), &2023_u32, &10_0000000_i128);
+
+        // Authorized oracle must still succeed (lock released)
+        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &10_0000000_i128).unwrap();
+        let price = client.get_benchmark_price(&s(&env, "VCS"), &2023_u32).unwrap();
+        assert_eq!(price, 10_0000000_i128);
     }
 }

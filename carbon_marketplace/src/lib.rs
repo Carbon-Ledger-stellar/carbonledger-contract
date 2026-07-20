@@ -32,6 +32,7 @@ pub enum CarbonError {
     ProjectAlreadyExists   = 17,
     InvalidSerialRange     = 18,
     AlreadyInitialized     = 19,
+    ReentrancyGuard        = 20,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -43,6 +44,7 @@ pub enum DataKey {
     AllListings,
     Admin,
     UsdcToken,
+    Locked,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -111,9 +113,11 @@ impl CarbonMarketplaceContract {
         country: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         seller.require_auth();
 
         if amount <= 0 || price_per_credit_usdc <= 0 {
+            Self::release_lock(&env);
             return Err(CarbonError::ZeroAmountNotAllowed);
         }
 
@@ -145,6 +149,7 @@ impl CarbonMarketplaceContract {
             (symbol_short!("c_ledger"), symbol_short!("listed")),
             (listing_id, seller, batch_id, amount, price_per_credit_usdc),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -159,10 +164,15 @@ impl CarbonMarketplaceContract {
         listing_id: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         seller.require_auth();
 
-        let mut listing = Self::load_listing(&env, &listing_id)?;
+        let mut listing = match Self::load_listing(&env, &listing_id) {
+            Ok(l) => l,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
         if listing.seller != seller {
+            Self::release_lock(&env);
             return Err(CarbonError::UnauthorizedVerifier);
         }
 
@@ -174,6 +184,7 @@ impl CarbonMarketplaceContract {
             (symbol_short!("c_ledger"), symbol_short!("delisted")),
             (listing_id, seller),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -190,19 +201,21 @@ impl CarbonMarketplaceContract {
         amount: i128,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         buyer.require_auth();
 
-        if amount <= 0 {
-            return Err(CarbonError::ZeroAmountNotAllowed);
-        }
+        if amount <= 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
 
-        let mut listing = Self::load_listing(&env, &listing_id)?;
+        let mut listing = match Self::load_listing(&env, &listing_id) {
+            Ok(l) => l,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
 
         if listing.status == ListingStatus::Delisted || listing.status == ListingStatus::Sold {
-            return Err(CarbonError::ListingNotFound);
+            Self::release_lock(&env); return Err(CarbonError::ListingNotFound);
         }
         if amount > listing.amount_available {
-            return Err(CarbonError::InsufficientLiquidity);
+            Self::release_lock(&env); return Err(CarbonError::InsufficientLiquidity);
         }
 
         // ── effects ───────────────────────────────────────────────────────────
@@ -230,6 +243,7 @@ impl CarbonMarketplaceContract {
             (symbol_short!("c_ledger"), symbol_short!("purchase")),
             (listing_id, buyer, listing.seller, amount, total_cost),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -243,10 +257,12 @@ impl CarbonMarketplaceContract {
         listing_ids: Vec<String>,
         amounts: Vec<i128>,
     ) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
         buyer.require_auth();
 
         let len = listing_ids.len();
         if len != amounts.len() {
+            Self::release_lock(&env);
             return Err(CarbonError::InvalidSerialRange);
         }
 
@@ -254,16 +270,17 @@ impl CarbonMarketplaceContract {
             let listing_id = listing_ids.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
 
-            if amount <= 0 {
-                return Err(CarbonError::ZeroAmountNotAllowed);
-            }
+            if amount <= 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
 
-            let mut listing = Self::load_listing(&env, &listing_id)?;
+            let mut listing = match Self::load_listing(&env, &listing_id) {
+                Ok(l) => l,
+                Err(e) => { Self::release_lock(&env); return Err(e); }
+            };
             if listing.status == ListingStatus::Delisted || listing.status == ListingStatus::Sold {
-                return Err(CarbonError::ListingNotFound);
+                Self::release_lock(&env); return Err(CarbonError::ListingNotFound);
             }
             if amount > listing.amount_available {
-                return Err(CarbonError::InsufficientLiquidity);
+                Self::release_lock(&env); return Err(CarbonError::InsufficientLiquidity);
             }
 
             let total_cost = listing.price_per_credit * amount;
@@ -290,6 +307,7 @@ impl CarbonMarketplaceContract {
                 (listing_id, buyer.clone(), amount, total_cost),
             );
         }
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -340,6 +358,20 @@ impl CarbonMarketplaceContract {
             }
         }
         result
+    }
+
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    fn acquire_lock(env: &Env) -> Result<(), CarbonError> {
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::Locked).unwrap_or(false) {
+            return Err(CarbonError::ReentrancyGuard);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    fn release_lock(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
     }
 }
 
@@ -468,5 +500,103 @@ mod tests {
         client.initialize(&admin, &usdc).unwrap();
         let result = client.try_initialize(&admin, &usdc);
         assert!(result.is_err());
+    }
+
+    // ── Reentrancy guard tests ─────────────────────────────────────────────────
+
+    /// Lock is released after list_credits succeeds; a second listing can be added.
+    #[test]
+    fn test_lock_released_after_list_credits() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        add_listing(&env, &client, &seller);
+        // Second listing with different id must succeed (lock released)
+        client.list_credits(
+            &seller,
+            &s(&env, "list-002"),
+            &s(&env, "batch-002"),
+            &s(&env, "proj-001"),
+            &50_i128,
+            &5_0000000_i128,
+            &2023_u32,
+            &s(&env, "VCS"),
+            &s(&env, "Brazil"),
+        ).unwrap();
+        let l = client.get_listing(&s(&env, "list-002")).unwrap();
+        assert_eq!(l.amount_available, 50);
+    }
+
+    /// Lock is released after delist_credits succeeds.
+    #[test]
+    fn test_lock_released_after_delist() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        add_listing(&env, &client, &seller);
+        client.delist_credits(&seller, &s(&env, "list-001")).unwrap();
+        // Add a new listing — lock must be free
+        client.list_credits(
+            &seller,
+            &s(&env, "list-003"),
+            &s(&env, "batch-003"),
+            &s(&env, "proj-001"),
+            &20_i128,
+            &5_0000000_i128,
+            &2023_u32,
+            &s(&env, "VCS"),
+            &s(&env, "Brazil"),
+        ).unwrap();
+        let l = client.get_listing(&s(&env, "list-003")).unwrap();
+        assert_eq!(l.status, ListingStatus::Active);
+    }
+
+    /// Lock is released after a failed list (zero amount).
+    #[test]
+    fn test_lock_released_after_failed_list() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        // Zero amount — should fail
+        let _ = client.try_list_credits(
+            &seller,
+            &s(&env, "list-bad"),
+            &s(&env, "batch-bad"),
+            &s(&env, "proj-001"),
+            &0_i128,
+            &5_0000000_i128,
+            &2023_u32,
+            &s(&env, "VCS"),
+            &s(&env, "Brazil"),
+        );
+        // Lock must be free — valid listing must succeed
+        add_listing(&env, &client, &seller);
+        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        assert_eq!(l.status, ListingStatus::Active);
+    }
+
+    /// Lock is released after a failed delist (listing not found).
+    #[test]
+    fn test_lock_released_after_failed_delist() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        // Delist non-existent listing
+        let _ = client.try_delist_credits(&seller, &s(&env, "no-such-listing"));
+        // Create a valid listing — lock must be free
+        add_listing(&env, &client, &seller);
+        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        assert_eq!(l.status, ListingStatus::Active);
+    }
+
+    /// Lock is released after a failed purchase (insufficient liquidity).
+    #[test]
+    fn test_lock_released_after_failed_purchase() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        add_listing(&env, &client, &seller);
+        let buyer = Address::generate(&env);
+        // Over-buy — should fail
+        let _ = client.try_purchase_credits(&buyer, &s(&env, "list-001"), &999_i128);
+        // Delist must succeed (lock released)
+        client.delist_credits(&seller, &s(&env, "list-001")).unwrap();
+        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        assert_eq!(l.status, ListingStatus::Delisted);
     }
 }

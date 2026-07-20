@@ -31,6 +31,7 @@ pub enum CarbonError {
     ProjectAlreadyExists   = 17,
     InvalidSerialRange     = 18,
     AlreadyInitialized     = 19,
+    ReentrancyGuard        = 20,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -44,6 +45,7 @@ pub enum DataKey {
     SerialRegistry,
     Admin,
     RegistryContract,
+    Locked,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -144,25 +146,18 @@ impl CarbonCreditContract {
         metadata_cid: String,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
 
-        if amount <= 0 {
-            return Err(CarbonError::ZeroAmountNotAllowed);
-        }
-        if serial_end < serial_start {
-            return Err(CarbonError::InvalidSerialRange);
-        }
-        if vintage_year < 2000 || vintage_year > 2100 {
-            return Err(CarbonError::InvalidVintageYear);
-        }
+        if amount <= 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
+        if serial_end < serial_start { Self::release_lock(&env); return Err(CarbonError::InvalidSerialRange); }
+        if vintage_year < 2000 || vintage_year > 2100 { Self::release_lock(&env); return Err(CarbonError::InvalidVintageYear); }
         if env.storage().persistent().has(&DataKey::Batch(batch_id.clone())) {
-            return Err(CarbonError::SerialNumberConflict);
+            Self::release_lock(&env); return Err(CarbonError::SerialNumberConflict);
         }
-
-        // Enforce global serial uniqueness
         if !Self::verify_serial_range_internal(&env, serial_start, serial_end) {
-            return Err(CarbonError::DoubleCountingDetected);
+            Self::release_lock(&env); return Err(CarbonError::DoubleCountingDetected);
         }
 
         // ── effects ───────────────────────────────────────────────────────────
@@ -201,6 +196,7 @@ impl CarbonCreditContract {
             (symbol_short!("c_ledger"), symbol_short!("minted")),
             (batch_id, project_id, amount, vintage_year, serial_start, serial_end),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -223,25 +219,21 @@ impl CarbonCreditContract {
         tx_hash: String,
     ) -> Result<RetirementCertificate, CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         holder.require_auth();
 
-        if amount <= 0 {
-            return Err(CarbonError::ZeroAmountNotAllowed);
-        }
+        if amount <= 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
 
-        let mut batch = Self::load_batch(&env, &batch_id)?;
+        let mut batch = match Self::load_batch(&env, &batch_id) {
+            Ok(b) => b,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
 
-        if batch.status == CreditStatus::FullyRetired {
-            return Err(CarbonError::AlreadyRetired);
-        }
-        if batch.status == CreditStatus::Suspended {
-            return Err(CarbonError::ProjectSuspended);
-        }
+        if batch.status == CreditStatus::FullyRetired { Self::release_lock(&env); return Err(CarbonError::AlreadyRetired); }
+        if batch.status == CreditStatus::Suspended { Self::release_lock(&env); return Err(CarbonError::ProjectSuspended); }
 
         let active_amount = Self::active_amount(&env, &batch);
-        if amount > active_amount {
-            return Err(CarbonError::InsufficientCredits);
-        }
+        if amount > active_amount { Self::release_lock(&env); return Err(CarbonError::InsufficientCredits); }
 
         // ── effects ───────────────────────────────────────────────────────────
         // Compute serial numbers for this retirement slice
@@ -293,6 +285,7 @@ impl CarbonCreditContract {
             (symbol_short!("c_ledger"), symbol_short!("retired")),
             (retirement_id, batch_id, batch.project_id, amount, holder, beneficiary),
         );
+        Self::release_lock(&env);
         Ok(cert)
     }
 
@@ -309,31 +302,28 @@ impl CarbonCreditContract {
         amount: i128,
     ) -> Result<(), CarbonError> {
         // ── checks ────────────────────────────────────────────────────────────
+        Self::acquire_lock(&env)?;
         from.require_auth();
 
-        if amount <= 0 {
-            return Err(CarbonError::ZeroAmountNotAllowed);
-        }
+        if amount <= 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
 
-        let batch = Self::load_batch(&env, &batch_id)?;
+        let batch = match Self::load_batch(&env, &batch_id) {
+            Ok(b) => b,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
 
-        if batch.status == CreditStatus::FullyRetired {
-            return Err(CarbonError::AlreadyRetired);
-        }
-        if batch.status == CreditStatus::Suspended {
-            return Err(CarbonError::ProjectSuspended);
-        }
+        if batch.status == CreditStatus::FullyRetired { Self::release_lock(&env); return Err(CarbonError::AlreadyRetired); }
+        if batch.status == CreditStatus::Suspended { Self::release_lock(&env); return Err(CarbonError::ProjectSuspended); }
 
         let active = Self::active_amount(&env, &batch);
-        if amount > active {
-            return Err(CarbonError::InsufficientCredits);
-        }
+        if amount > active { Self::release_lock(&env); return Err(CarbonError::InsufficientCredits); }
 
         // ── effects ───────────────────────────────────────────────────────────
         env.events().publish(
             (symbol_short!("c_ledger"), symbol_short!("transfer")),
             (batch_id, from, to, amount),
         );
+        Self::release_lock(&env);
         Ok(())
     }
 
@@ -424,6 +414,20 @@ impl CarbonCreditContract {
             }
         }
         true
+    }
+
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    fn acquire_lock(env: &Env) -> Result<(), CarbonError> {
+        if env.storage().instance().get::<DataKey, bool>(&DataKey::Locked).unwrap_or(false) {
+            return Err(CarbonError::ReentrancyGuard);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    fn release_lock(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
     }
 }
 
@@ -643,5 +647,106 @@ mod tests {
         c.initialize(&admin, &registry).unwrap();
         let result = c.try_initialize(&admin, &registry);
         assert!(result.is_err());
+    }
+
+    // ── Reentrancy guard tests ─────────────────────────────────────────────────
+
+    /// Lock is released after mint_credits succeeds; second mint on different batch works.
+    #[test]
+    fn test_lock_released_after_mint() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin    = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(&env, &id);
+        c.initialize(&admin, &registry).unwrap();
+
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        // non-overlapping range: lock must be free
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b2"), &101_u64, &200_u64, &s(&env, "cid")).unwrap();
+
+        let b = c.get_credit_batch(&s(&env, "b2")).unwrap();
+        assert_eq!(b.amount, 100);
+    }
+
+    /// Lock is released after retire_credits succeeds.
+    #[test]
+    fn test_lock_released_after_retire() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin    = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(&env, &id);
+        c.initialize(&admin, &registry).unwrap();
+
+        c.mint_credits(&admin, &s(&env, "p1"), &200_i128, &2023_u32, &s(&env, "b1"), &1_u64, &200_u64, &s(&env, "cid")).unwrap();
+
+        let holder = Address::generate(&env);
+        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r1"), &s(&env, "tx")).unwrap();
+        // retire again on the same batch (partial left): lock must be free
+        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r2"), &s(&env, "tx2")).unwrap();
+
+        let b = c.get_credit_batch(&s(&env, "b1")).unwrap();
+        assert_eq!(b.status, CreditStatus::FullyRetired);
+    }
+
+    /// Lock is released after a failed retire (over-retirement attempt).
+    #[test]
+    fn test_lock_released_after_failed_retire() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin    = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(&env, &id);
+        c.initialize(&admin, &registry).unwrap();
+
+        c.mint_credits(&admin, &s(&env, "p1"), &50_i128, &2023_u32, &s(&env, "b1"), &1_u64, &50_u64, &s(&env, "cid")).unwrap();
+
+        let holder = Address::generate(&env);
+        // This should fail (too many)
+        let _ = c.try_retire_credits(&holder, &s(&env, "b1"), &999_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r1"), &s(&env, "tx"));
+        // Lock must be free — valid retire should succeed
+        c.retire_credits(&holder, &s(&env, "b1"), &50_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r2"), &s(&env, "tx2")).unwrap();
+    }
+
+    /// Lock is released after transfer_credits succeeds.
+    #[test]
+    fn test_lock_released_after_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin    = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(&env, &id);
+        c.initialize(&admin, &registry).unwrap();
+
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+
+        let from = Address::generate(&env);
+        let to   = Address::generate(&env);
+        c.transfer_credits(&from, &to, &s(&env, "b1"), &10_i128).unwrap();
+        // Second transfer: lock must be free
+        c.transfer_credits(&from, &to, &s(&env, "b1"), &10_i128).unwrap();
+    }
+
+    /// Lock is released after a failed mint (duplicate batch id).
+    #[test]
+    fn test_lock_released_after_failed_mint() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin    = Address::generate(&env);
+        let registry = Address::generate(&env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(&env, &id);
+        c.initialize(&admin, &registry).unwrap();
+
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        // Duplicate batch_id — should fail
+        let _ = c.try_mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &201_u64, &300_u64, &s(&env, "cid"));
+        // New batch on free range must succeed (lock released)
+        c.mint_credits(&admin, &s(&env, "p1"), &50_i128, &2023_u32, &s(&env, "b3"), &201_u64, &250_u64, &s(&env, "cid")).unwrap();
     }
 }
