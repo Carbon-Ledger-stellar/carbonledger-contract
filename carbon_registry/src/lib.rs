@@ -122,7 +122,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
 
         if env.storage().persistent().has(&DataKey::Project(project_id.clone())) {
             Self::release_lock(&env);
@@ -172,7 +172,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         verifier_address.require_auth();
-        Self::require_verifier(&env, &verifier_address)?;
+        if let Err(e) = Self::require_verifier(&env, &verifier_address) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -205,7 +205,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         verifier_address.require_auth();
-        Self::require_verifier(&env, &verifier_address)?;
+        if let Err(e) = Self::require_verifier(&env, &verifier_address) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -238,7 +238,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         oracle_address.require_auth();
-        Self::require_oracle(&env, &oracle_address)?;
+        if let Err(e) = Self::require_oracle(&env, &oracle_address) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -270,7 +270,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -306,7 +306,7 @@ impl CarbonRegistryContract {
     ) -> Result<(), CarbonError> {
         Self::acquire_lock(&env)?;
         oracle_address.require_auth();
-        Self::require_oracle(&env, &oracle_address)?;
+        if let Err(e) = Self::require_oracle(&env, &oracle_address) { Self::release_lock(&env); return Err(e); }
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
             Err(e) => { Self::release_lock(&env); return Err(e); }
