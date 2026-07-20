@@ -306,7 +306,7 @@ mod tests {
         let oracle = Address::generate(env);
         let id     = env.register_contract(None, CarbonOracleContract);
         let client = CarbonOracleContractClient::new(env, &id);
-        client.initialize(&admin, &oracle).unwrap();
+        client.initialize(&admin, &oracle);
         (client, admin, oracle)
     }
 
@@ -322,9 +322,9 @@ mod tests {
             &5000_i128,
             &85_u32,
             &s(&env, "QmSatCID"),
-        ).unwrap();
+        );
 
-        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q1")).unwrap();
+        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q1"));
         assert_eq!(data.tonnes_verified, 5000);
         assert_eq!(data.methodology_score, 85);
     }
@@ -351,8 +351,8 @@ mod tests {
         let env = Env::default();
         let (client, _, oracle) = setup(&env);
 
-        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &15_0000000_i128).unwrap();
-        let price = client.get_benchmark_price(&s(&env, "VCS"), &2023_u32).unwrap();
+        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &15_0000000_i128);
+        let price = client.get_benchmark_price(&s(&env, "VCS"), &2023_u32);
         assert_eq!(price, 15_0000000_i128);
     }
 
@@ -369,7 +369,7 @@ mod tests {
         let env = Env::default();
         let (client, _, oracle) = setup(&env);
 
-        client.flag_project(&oracle, &s(&env, "proj-001"), &s(&env, "satellite contradiction")).unwrap();
+        client.flag_project(&oracle, &s(&env, "proj-001"), &s(&env, "satellite contradiction"));
         // Verify event was emitted (no error = success)
     }
 
@@ -397,7 +397,7 @@ mod tests {
             &1000_i128,
             &80_u32,
             &s(&env, "QmCID"),
-        ).unwrap();
+        );
 
         // Advance time by 366 days
         env.ledger().set(LedgerInfo {
@@ -426,7 +426,7 @@ mod tests {
             &1000_i128,
             &80_u32,
             &s(&env, "QmCID"),
-        ).unwrap();
+        );
 
         assert!(client.is_monitoring_current(&s(&env, "proj-001")));
     }
@@ -439,7 +439,7 @@ mod tests {
         let oracle = Address::generate(&env);
         let id     = env.register_contract(None, CarbonOracleContract);
         let client = CarbonOracleContractClient::new(&env, &id);
-        client.initialize(&admin, &oracle).unwrap();
+        client.initialize(&admin, &oracle);
         let result = client.try_initialize(&admin, &oracle);
         assert!(result.is_err());
     }
@@ -455,15 +455,15 @@ mod tests {
         client.submit_monitoring_data(
             &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q1"),
             &5000_i128, &85_u32, &s(&env, "QmCID1"),
-        ).unwrap();
+        );
 
         // Second call with different period — lock must be free
         client.submit_monitoring_data(
             &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q2"),
             &4000_i128, &80_u32, &s(&env, "QmCID2"),
-        ).unwrap();
+        );
 
-        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q2")).unwrap();
+        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q2"));
         assert_eq!(data.tonnes_verified, 4000);
     }
 
@@ -473,11 +473,11 @@ mod tests {
         let env = Env::default();
         let (client, _, oracle) = setup(&env);
 
-        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &15_0000000_i128).unwrap();
+        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &15_0000000_i128);
         // Second price update for different vintage — lock must be free
-        client.update_credit_price(&oracle, &s(&env, "VCS"), &2024_u32, &20_0000000_i128).unwrap();
+        client.update_credit_price(&oracle, &s(&env, "VCS"), &2024_u32, &20_0000000_i128);
 
-        let price = client.get_benchmark_price(&s(&env, "VCS"), &2024_u32).unwrap();
+        let price = client.get_benchmark_price(&s(&env, "VCS"), &2024_u32);
         assert_eq!(price, 20_0000000_i128);
     }
 
@@ -487,9 +487,9 @@ mod tests {
         let env = Env::default();
         let (client, _, oracle) = setup(&env);
 
-        client.flag_project(&oracle, &s(&env, "proj-001"), &s(&env, "contradiction")).unwrap();
+        client.flag_project(&oracle, &s(&env, "proj-001"), &s(&env, "contradiction"));
         // Second flag on different project — lock must be free
-        client.flag_project(&oracle, &s(&env, "proj-002"), &s(&env, "double-count")).unwrap();
+        client.flag_project(&oracle, &s(&env, "proj-002"), &s(&env, "double-count"));
     }
 
     /// Lock is released after a failed submit (zero tonnes).
@@ -508,9 +508,9 @@ mod tests {
         client.submit_monitoring_data(
             &oracle, &s(&env, "proj-001"), &s(&env, "2023-Q1"),
             &1000_i128, &80_u32, &s(&env, "QmCID"),
-        ).unwrap();
+        );
 
-        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q1")).unwrap();
+        let data = client.get_monitoring_data(&s(&env, "proj-001"), &s(&env, "2023-Q1"));
         assert_eq!(data.tonnes_verified, 1000);
     }
 
@@ -525,8 +525,8 @@ mod tests {
         let _ = client.try_update_credit_price(&rogue, &s(&env, "VCS"), &2023_u32, &10_0000000_i128);
 
         // Authorized oracle must still succeed (lock released)
-        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &10_0000000_i128).unwrap();
-        let price = client.get_benchmark_price(&s(&env, "VCS"), &2023_u32).unwrap();
+        client.update_credit_price(&oracle, &s(&env, "VCS"), &2023_u32, &10_0000000_i128);
+        let price = client.get_benchmark_price(&s(&env, "VCS"), &2023_u32);
         assert_eq!(price, 10_0000000_i128);
     }
 }

@@ -1,0 +1,10 @@
+[toolchain]
+# Pinned deliberately. soroban-env-common 20.3.0 pulls in ethnum 1.5.0, which
+# transmutes `()` into `std::num::TryFromIntError`. That type is no longer a
+# ZST in recent std, so the transmute fails E0512 on rustc >= ~1.87. 1.85.0 is
+# the newest toolchain that builds this dependency tree cleanly.
+#
+# Revisit when soroban-sdk is upgraded past 20.x.
+channel = "1.85.0"
+targets = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]

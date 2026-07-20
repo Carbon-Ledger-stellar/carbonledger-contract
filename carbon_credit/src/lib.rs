@@ -445,7 +445,7 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let client = CarbonCreditContractClient::new(&env, &id);
-        client.initialize(&admin, &registry).unwrap();
+        client.initialize(&admin, &registry);
         (env, client)
     }
 
@@ -471,7 +471,7 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
         c.mint_credits(
             &admin,
@@ -482,9 +482,9 @@ mod tests {
             &1_u64,
             &500_u64,
             &s(&env, "QmCID"),
-        ).unwrap();
+        );
 
-        let b = c.get_credit_batch(&s(&env, "batch-A")).unwrap();
+        let b = c.get_credit_batch(&s(&env, "batch-A"));
         assert_eq!(b.amount, 500);
         assert_eq!(b.status, CreditStatus::Active);
     }
@@ -496,9 +496,9 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
         // Overlapping range 50-150 should fail
         let result = c.try_mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b2"), &50_u64, &150_u64, &s(&env, "cid"));
         assert!(result.is_err());
@@ -511,9 +511,9 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
         // Non-overlapping range should return true
         assert!(c.verify_serial_range(&101_u64, &200_u64));
         // Overlapping range should return false
@@ -527,9 +527,9 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
 
         let holder = Address::generate(&env);
         let cert = c.retire_credits(
@@ -540,12 +540,12 @@ mod tests {
             &s(&env, "Acme Corp"),
             &s(&env, "ret-001"),
             &s(&env, "txhash123"),
-        ).unwrap();
+        );
 
         assert_eq!(cert.amount, 100);
         assert_eq!(cert.beneficiary, s(&env, "Acme Corp"));
 
-        let batch = c.get_credit_batch(&s(&env, "b1")).unwrap();
+        let batch = c.get_credit_batch(&s(&env, "b1"));
         assert_eq!(batch.status, CreditStatus::FullyRetired);
     }
 
@@ -556,12 +556,12 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
 
         let holder = Address::generate(&env);
-        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx")).unwrap();
+        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx"));
 
         let to = Address::generate(&env);
         let result = c.try_transfer_credits(&holder, &to, &s(&env, "b1"), &10_i128);
@@ -575,12 +575,12 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
 
         let holder = Address::generate(&env);
-        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx")).unwrap();
+        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx"));
 
         let result = c.try_retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-002"), &s(&env, "tx2"));
         assert!(result.is_err());
@@ -593,14 +593,14 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
 
         let holder = Address::generate(&env);
-        c.retire_credits(&holder, &s(&env, "b1"), &40_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx")).unwrap();
+        c.retire_credits(&holder, &s(&env, "b1"), &40_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx"));
 
-        let batch = c.get_credit_batch(&s(&env, "b1")).unwrap();
+        let batch = c.get_credit_batch(&s(&env, "b1"));
         assert_eq!(batch.status, CreditStatus::PartiallyRetired);
     }
 
@@ -611,14 +611,14 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
 
         let holder = Address::generate(&env);
-        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx")).unwrap();
+        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "ret-001"), &s(&env, "tx"));
 
-        let cert = c.get_retirement_certificate(&s(&env, "ret-001")).unwrap();
+        let cert = c.get_retirement_certificate(&s(&env, "ret-001"));
         assert_eq!(cert.amount, 100);
         assert_eq!(cert.retirement_id, s(&env, "ret-001"));
     }
@@ -630,7 +630,7 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
         let result = c.try_mint_credits(&admin, &s(&env, "p1"), &0_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
         assert!(result.is_err());
@@ -644,7 +644,7 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
         let result = c.try_initialize(&admin, &registry);
         assert!(result.is_err());
     }
@@ -660,13 +660,13 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
         // non-overlapping range: lock must be free
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b2"), &101_u64, &200_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b2"), &101_u64, &200_u64, &s(&env, "cid"));
 
-        let b = c.get_credit_batch(&s(&env, "b2")).unwrap();
+        let b = c.get_credit_batch(&s(&env, "b2"));
         assert_eq!(b.amount, 100);
     }
 
@@ -679,16 +679,16 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &200_i128, &2023_u32, &s(&env, "b1"), &1_u64, &200_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &200_i128, &2023_u32, &s(&env, "b1"), &1_u64, &200_u64, &s(&env, "cid"));
 
         let holder = Address::generate(&env);
-        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r1"), &s(&env, "tx")).unwrap();
+        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r1"), &s(&env, "tx"));
         // retire again on the same batch (partial left): lock must be free
-        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r2"), &s(&env, "tx2")).unwrap();
+        c.retire_credits(&holder, &s(&env, "b1"), &100_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r2"), &s(&env, "tx2"));
 
-        let b = c.get_credit_batch(&s(&env, "b1")).unwrap();
+        let b = c.get_credit_batch(&s(&env, "b1"));
         assert_eq!(b.status, CreditStatus::FullyRetired);
     }
 
@@ -701,15 +701,15 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &50_i128, &2023_u32, &s(&env, "b1"), &1_u64, &50_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &50_i128, &2023_u32, &s(&env, "b1"), &1_u64, &50_u64, &s(&env, "cid"));
 
         let holder = Address::generate(&env);
         // This should fail (too many)
         let _ = c.try_retire_credits(&holder, &s(&env, "b1"), &999_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r1"), &s(&env, "tx"));
         // Lock must be free — valid retire should succeed
-        c.retire_credits(&holder, &s(&env, "b1"), &50_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r2"), &s(&env, "tx2")).unwrap();
+        c.retire_credits(&holder, &s(&env, "b1"), &50_i128, &s(&env, "reason"), &s(&env, "Corp"), &s(&env, "r2"), &s(&env, "tx2"));
     }
 
     /// Lock is released after transfer_credits succeeds.
@@ -721,15 +721,15 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
 
         let from = Address::generate(&env);
         let to   = Address::generate(&env);
-        c.transfer_credits(&from, &to, &s(&env, "b1"), &10_i128).unwrap();
+        c.transfer_credits(&from, &to, &s(&env, "b1"), &10_i128);
         // Second transfer: lock must be free
-        c.transfer_credits(&from, &to, &s(&env, "b1"), &10_i128).unwrap();
+        c.transfer_credits(&from, &to, &s(&env, "b1"), &10_i128);
     }
 
     /// Lock is released after a failed mint (duplicate batch id).
@@ -741,12 +741,12 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
-        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &1_u64, &100_u64, &s(&env, "cid"));
         // Duplicate batch_id — should fail
         let _ = c.try_mint_credits(&admin, &s(&env, "p1"), &100_i128, &2023_u32, &s(&env, "b1"), &201_u64, &300_u64, &s(&env, "cid"));
         // New batch on free range must succeed (lock released)
-        c.mint_credits(&admin, &s(&env, "p1"), &50_i128, &2023_u32, &s(&env, "b3"), &201_u64, &250_u64, &s(&env, "cid")).unwrap();
+        c.mint_credits(&admin, &s(&env, "p1"), &50_i128, &2023_u32, &s(&env, "b3"), &201_u64, &250_u64, &s(&env, "cid"));
     }
 }

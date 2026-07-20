@@ -394,7 +394,7 @@ mod tests {
         let usdc   = env.register_stellar_asset_contract(admin.clone());
         let id     = env.register_contract(None, CarbonMarketplaceContract);
         let client = CarbonMarketplaceContractClient::new(env, &id);
-        client.initialize(&admin, &usdc).unwrap();
+        client.initialize(&admin, &usdc);
         (client, admin, seller, usdc)
     }
 
@@ -409,7 +409,7 @@ mod tests {
             &2023_u32,
             &s(env, "VCS"),
             &s(env, "Brazil"),
-        ).unwrap();
+        );
     }
 
     #[test]
@@ -417,7 +417,7 @@ mod tests {
         let env = Env::default();
         let (client, _, seller, _) = setup(&env);
         add_listing(&env, &client, &seller);
-        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        let l = client.get_listing(&s(&env, "list-001"));
         assert_eq!(l.status, ListingStatus::Active);
         assert_eq!(l.amount_available, 100);
     }
@@ -427,8 +427,8 @@ mod tests {
         let env = Env::default();
         let (client, _, seller, _) = setup(&env);
         add_listing(&env, &client, &seller);
-        client.delist_credits(&seller, &s(&env, "list-001")).unwrap();
-        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        client.delist_credits(&seller, &s(&env, "list-001"));
+        let l = client.get_listing(&s(&env, "list-001"));
         assert_eq!(l.status, ListingStatus::Delisted);
     }
 
@@ -497,7 +497,7 @@ mod tests {
         let usdc  = env.register_stellar_asset_contract(admin.clone());
         let id    = env.register_contract(None, CarbonMarketplaceContract);
         let client = CarbonMarketplaceContractClient::new(&env, &id);
-        client.initialize(&admin, &usdc).unwrap();
+        client.initialize(&admin, &usdc);
         let result = client.try_initialize(&admin, &usdc);
         assert!(result.is_err());
     }
@@ -521,8 +521,8 @@ mod tests {
             &2023_u32,
             &s(&env, "VCS"),
             &s(&env, "Brazil"),
-        ).unwrap();
-        let l = client.get_listing(&s(&env, "list-002")).unwrap();
+        );
+        let l = client.get_listing(&s(&env, "list-002"));
         assert_eq!(l.amount_available, 50);
     }
 
@@ -532,7 +532,7 @@ mod tests {
         let env = Env::default();
         let (client, _, seller, _) = setup(&env);
         add_listing(&env, &client, &seller);
-        client.delist_credits(&seller, &s(&env, "list-001")).unwrap();
+        client.delist_credits(&seller, &s(&env, "list-001"));
         // Add a new listing — lock must be free
         client.list_credits(
             &seller,
@@ -544,8 +544,8 @@ mod tests {
             &2023_u32,
             &s(&env, "VCS"),
             &s(&env, "Brazil"),
-        ).unwrap();
-        let l = client.get_listing(&s(&env, "list-003")).unwrap();
+        );
+        let l = client.get_listing(&s(&env, "list-003"));
         assert_eq!(l.status, ListingStatus::Active);
     }
 
@@ -568,7 +568,7 @@ mod tests {
         );
         // Lock must be free — valid listing must succeed
         add_listing(&env, &client, &seller);
-        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        let l = client.get_listing(&s(&env, "list-001"));
         assert_eq!(l.status, ListingStatus::Active);
     }
 
@@ -581,7 +581,7 @@ mod tests {
         let _ = client.try_delist_credits(&seller, &s(&env, "no-such-listing"));
         // Create a valid listing — lock must be free
         add_listing(&env, &client, &seller);
-        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        let l = client.get_listing(&s(&env, "list-001"));
         assert_eq!(l.status, ListingStatus::Active);
     }
 
@@ -595,8 +595,8 @@ mod tests {
         // Over-buy — should fail
         let _ = client.try_purchase_credits(&buyer, &s(&env, "list-001"), &999_i128);
         // Delist must succeed (lock released)
-        client.delist_credits(&seller, &s(&env, "list-001")).unwrap();
-        let l = client.get_listing(&s(&env, "list-001")).unwrap();
+        client.delist_credits(&seller, &s(&env, "list-001"));
+        let l = client.get_listing(&s(&env, "list-001"));
         assert_eq!(l.status, ListingStatus::Delisted);
     }
 }
