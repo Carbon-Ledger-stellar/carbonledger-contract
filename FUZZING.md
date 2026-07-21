@@ -1,39 +1,77 @@
 # Stateful fuzzing
 
-`carbon_fuzz` drives the contracts through randomly generated operation
-sequences and checks, after every operation, that the contract agrees with an
-independent shadow model and that a set of safety invariants still hold.
+`carbon_fuzz` drives **all four CarbonLedger contracts** through randomly
+generated lifecycle sequences and checks, after every operation, that each
+contract agrees with an independent shadow model and that a set of safety
+invariants still hold. On failure it shrinks the sequence to a minimal
+reproducer.
 
-The current campaign covers **`carbon_credit`**. The other three contracts are
-not yet modelled — see [Coverage](#coverage).
+The campaign covers the full cross-contract lifecycle:
+
+```
+register → verify → (monitor / price / flag) → mint → transfer → list → purchase → retire
+   registry        registry     oracle         credit   credit    market  market    credit
+```
 
 ## Running
 
 ```bash
-cargo test -p carbon_fuzz                 # default campaign, ~30s
-FUZZ_SEEDS=500 cargo test -p carbon_fuzz  # a wider campaign
+cargo test -p carbon_fuzz                     # default campaign, ~15s (debug)
+FUZZ_SEQS=2000 cargo test -p carbon_fuzz      # a wider debug campaign
 ```
 
 The toolchain is pinned in `rust-toolchain.toml`. It must be — `ethnum 1.5.0`,
 pulled in transitively by `soroban-env-common 20.3.0`, fails to compile on
-rustc ≳1.87 with `E0512`. Use the pinned toolchain rather than working around
-it locally.
+rustc ≳1.87 with `E0512`. Use the pinned toolchain rather than working around it.
+
+### The 50k soak
+
+The acceptance target — 50,000+ sequences in under 30 minutes — is the job of
+the **release** soak. Release is not optional: the Soroban test host is roughly
+two orders of magnitude slower unoptimized (a fresh `Env` alone is ~20 ms in
+debug versus microseconds in release), and the whole budget is spent on host
+invocations, so only a release build has any hope of the target. The design
+holds per-operation cost to the single invocation the operation itself requires
+(see [Throughput](#throughput)); tune `FUZZ_SEQS` to your runner.
+
+```bash
+FUZZ_SEQS=50000 FUZZ_DEEP=0 cargo test --release -p carbon_fuzz --test harness campaign
+```
+
+`FUZZ_DEEP=0` turns off per-world contract-state reconciliation, which costs a
+getter invocation per entity. With it off, the only invocation per operation is
+the operation itself, which is what keeps the soak inside the time budget (see
+[Throughput](#throughput)). The narrower default campaign keeps `FUZZ_DEEP` on
+so it reconciles contract state too.
 
 ## Reproducing a failure
 
 Every run is a pure function of its seed: the harness uses a SplitMix64 PRNG
-(`tests/harness/rng.rs`) and never touches the system clock or thread RNG. A
-failure reports the seed, so:
+(`tests/harness/rng.rs`) and never touches the system clock or thread RNG.
+
+**On failure the campaign prints a minimal reproducer.** It catches the failing
+sequence, runs delta debugging (`tests/harness/shrink.rs`) to drop every
+operation that is not needed to still trigger the failure, and prints the
+handful that remain:
+
+```
+──────────────── fuzz failure ────────────────
+seed=0  sequence=4137
+panic: retire on b4137_2: model predicted Ok(()) but contract returned Err(InsufficientCredits)
+raw sequence: 12 ops
+minimal reproducer: 2 ops
+  [ 0] Mint { seq: 4137, actor: 0, project: 0, batch: 2, amount: 50, ... }
+  [ 1] Retire { seq: 4137, actor: 3, batch: 2, amount: 51, ... }
+
+replay this campaign with:
+  FUZZ_SEED=0 cargo test --release -p carbon_fuzz --test harness replay -- --nocapture
+───────────────────────────────────────────────
+```
+
+The whole campaign replays deterministically from its seed:
 
 ```bash
-FUZZ_SEED=137 cargo test -p carbon_fuzz --test harness replay -- --nocapture
-```
-
-Failures name the operation and the batch involved, e.g.
-
-```
-mint on batch-5: model predicted Err(DoubleCountingDetected)
-                 but contract returned Err(InvalidVintageYear)
+FUZZ_SEED=0 cargo test -p carbon_fuzz --test harness replay -- --nocapture
 ```
 
 ## How it works
@@ -41,87 +79,114 @@ mint on batch-5: model predicted Err(DoubleCountingDetected)
 | Module | Role |
 |---|---|
 | `rng.rs` | Deterministic SplitMix64. Seeds are plain sequence indices. |
-| `model.rs` | Shadow model — a plain-Rust reimplementation of intended behaviour. |
-| `ops.rs` | Operation generator. |
+| `model.rs` | Shadow model — one plain-Rust sub-model per contract. |
+| `ops.rs` | Precondition-aware operation generator. |
 | `exec.rs` | Runs each op against contract *and* model, compares both. |
-| `invariants.rs` | Safety properties checked against contract state. |
+| `invariants.rs` | Safety properties + cross-contract gap reporting. |
+| `shrink.rs` | Delta debugging to a minimal reproducer. |
 
-Two things are worth knowing before extending it.
+Things worth knowing before extending it.
 
 **The model is written from documented behaviour, not from the contract
-source.** That independence is the entire point — a model derived by reading
-the implementation would reproduce its bugs and agree with it perfectly. When
-model and contract disagree, *either* may be wrong, and both outcomes are
-worth investigating.
+source.** That independence is the entire point — a model derived by reading the
+implementation would reproduce its bugs and agree with it perfectly. When model
+and contract disagree, *either* may be wrong, and both are worth investigating.
 
-**Check ordering is load-bearing.** `mint_credits` validates in a fixed
-sequence and returns the first failure. The model must reject in the same
-order or it will predict the right *outcome* with the wrong *error code*.
+**Check ordering is load-bearing.** Every mutating entry point validates in a
+fixed sequence and returns the first failure. Each sub-model must reject in the
+same order or it will predict the right *outcome* with the wrong *error code*.
 
-The generator draws ids from deliberately small pools (6 batches, 3 projects)
-and cramped serial ranges. Uniformly random arguments would essentially never
-collide, so duplicate-id and serial-overlap rejection would never be exercised.
+**Generation is precondition-aware.** The generator tracks what it has already
+created (registered projects, minted batches, live listings) and biases toward
+operations whose preconditions hold — you can't retire before issuance — so the
+deep lifecycle actually gets exercised. It still injects invalid operations at a
+low rate (wrong caller, absent id, zero amount, overlapping serials) so every
+rejection path is covered too. Ids are drawn from small pools so collisions —
+duplicate ids, serial overlaps, over-retirement — are common rather than
+astronomically rare.
+
+### Throughput
+
+Real Soroban host invocations are the wall: each is single-digit milliseconds in
+release, and a single `Env` cannot absorb unbounded invocations (the test host
+accumulates auth/event state and eventually aborts). Two design choices keep
+50k sequences affordable:
+
+- **One world is reused across `WORLD_BATCH` sequences**, with every id
+  namespaced by sequence index so the sequences stay independent. This amortizes
+  the ~14 ms cost of building a world (registering four contracts, generating
+  addresses, funding the USDC token) while bounding both the per-`Env` invocation
+  count and the growth of the contracts' global lists (`SerialRegistry`,
+  `AllListings`), which are re-serialized in full on every write.
+- **Per-operation checking reads only the model** (zero extra invocations); the
+  operation's own call is the sole invocation, and its result is compared to the
+  model's prediction. `retire` additionally validates the returned certificate
+  for free. Contract-state reconciliation is reserved for `deep_reconcile`, run
+  once per world in the default campaign and skipped in the soak.
 
 ### Budget
 
 Each operation resets to the *default* host budget, because on-chain each
 invocation is its own transaction with its own budget — accumulating across a
-60-op sequence is a harness artifact. It is reset to the default rather than to
+sequence is a harness artifact. It is reset to the default rather than to
 unlimited so that a single operation exhausting its budget is still detectable.
 This matters: `retire_credits` builds a `Vec<u64>` holding one entry per credit
 retired, so a large enough retirement is an out-of-budget trap rather than a
-returned error.
+returned error — which is why retirement amounts are bounded.
 
 ## Invariants
 
-Split by cost. Cheap model-only checks run after **every** operation, so a
-failure pins the exact culprit. Checks that re-read contract state cost a full
-invocation each and run once per sequence.
+Model-only (checked after **every** operation, so a failure pins the exact op):
 
-Per operation:
 - No two registered serial ranges overlap.
 - Retired never exceeds minted; active balance never negative.
-- Retirement certificates carve a batch's serials into disjoint, contiguous spans.
-- Certificate amounts sum to exactly the retired balance.
+- Retirement certificates carve a batch's serials into disjoint, contiguous
+  spans; certificate amounts sum to exactly the retired balance.
+- A listing's available amount stays in `[0, original]`, `Sold` iff drained.
+- USDC settlement is conservative — the total never changes, no balance negative.
 
-Per sequence:
+Deep, re-reading contract state (once per world, default campaign only):
+
+- Every model project / batch / listing status matches the contract's.
+- Every actor's USDC balance matches the model (fees and proceeds included).
 - The contract reports every registered serial range as unavailable.
-- `FullyRetired` is terminal, in both model and contract.
-- Status is a pure function of the retired amount.
-- Every minted batch is reachable via its project index.
 
-## Known gap: serial ranges are not reconciled with amount
+## Known gaps
 
-`known_gap_amount_not_reconciled_with_serial_range` documents a real defect
-rather than asserting it away.
+The harness surfaces real defects rather than asserting them away. These are
+reachable precisely because **the four contracts make no cross-contract calls to
+one another** — they are independent state machines linked only by string ids
+(the sole genuine cross-contract edge is marketplace → USDC token).
+`invariants::report_gaps` detects them from model state.
 
-`mint_credits` never checks `amount` against the width of the declared serial
-range, so a batch can be minted with `amount = 100` over serials `1..=5`.
-Retirement then allocates serials sequentially *by count* from `serial_start`,
-walking past `serial_end` into serials that were never registered in the global
-registry — and which may already belong to another batch.
+**Closed: serial range not reconciled with amount.** An earlier version of this
+harness documented an open gap — `mint_credits` did not check `amount` against
+the declared serial range, so a batch minted with `amount = 100` over serials
+`1..=5` let retirement walk serials past `serial_end` into numbers belonging to
+other batches, defeating the double-counting defence. Upstream closed it by
+requiring `serial_end - serial_start + 1 == amount` at mint. The harness caught
+the behaviour change on the first run against the updated contracts;
+`regression_mint_requires_serial_range_matches_amount` now pins the fix shut.
 
-The global overlap check guards range *declarations*, not the serials
-retirement actually hands out. Double-counting is therefore reachable despite
-that defence, which is the property the registry exists to guarantee.
+**Open — `known_gap_no_cross_contract_consistency`.** Nothing links the contracts:
 
-The fix is to require `amount == serial_end - serial_start + 1` at mint, or to
-bound retirement at `serial_end`. When that lands, the test fails and should be
-inverted into a regression test proving the gap is closed.
+- `mint_credits` never consults the registry, so credits can be minted for a
+  project that was never registered, never verified, rejected, or suspended.
+- `list_credits` never validates against `carbon_credit`, so a listing can offer
+  more credits than were ever minted — or name a batch that does not exist.
+- `purchase_credits` moves USDC but never moves credit ownership; a buyer pays
+  and the credit batch is left untouched.
+- `retire_credits` has no ownership check; any authenticated address may retire
+  any batch.
+
+When any of these is fixed, the corresponding test should be inverted into a
+regression test proving the gap is closed.
 
 ## Coverage
 
-Modelled: `carbon_credit` (mint, retire, transfer).
+Modelled: `carbon_registry` (register / verify / reject / suspend),
+`carbon_credit` (mint / retire / transfer), `carbon_marketplace` (list / delist
+/ purchase), `carbon_oracle` (monitoring / price / flag), and USDC settlement.
 
-Not yet modelled: `carbon_registry`, `carbon_marketplace`, `carbon_oracle`.
-
-Worth knowing when extending: **the four contracts make no cross-contract calls
-to each other.** They are independent state machines linked only by string ids.
-`carbon_credit` stores a registry address but never reads it, so minting does
-not check that a project exists or is verified; `carbon_marketplace` does not
-know `carbon_credit` exists, so a listing is never validated against a real
-batch. The only genuine cross-contract edge is marketplace → USDC token.
-
-Cross-contract consistency is therefore *not* an invariant the code upholds
-today. Asserting it in a future campaign will produce findings, not green
-tests — which is a reason to do it, but plan for the results.
+Out of scope (per the issue): fuzzing the external USDC token contract's
+internals, and performance tuning of the fuzzer itself.
