@@ -135,6 +135,10 @@ impl CarbonMarketplaceContract {
             created_at:       env.ledger().timestamp(),
             status:           ListingStatus::Active,
         };
+        if let Err(e) = Self::assert_valid_listing(&listing) {
+            Self::release_lock(&env);
+            return Err(e);
+        }
         env.storage().persistent().set(&DataKey::Listing(listing_id.clone()), &listing);
 
         let mut all: Vec<String> = env
@@ -331,6 +335,27 @@ impl CarbonMarketplaceContract {
     /// Returns all listings matching a given vintage year.
     pub fn get_listings_by_vintage(env: Env, vintage_year: u32) -> Vec<MarketListing> {
         Self::filter_listings(&env, |l| l.vintage_year == vintage_year)
+    }
+
+    // ── Validation helpers (Issue 2) ──────────────────────────────────────────
+
+    /// Assert that a [`MarketListing`] satisfies all data-structure invariants:
+    /// - `listing_id`, `batch_id`, `project_id`, `methodology`, `country` non-empty.
+    /// - `amount_available` > 0.
+    /// - `price_per_credit` > 0.
+    /// - `vintage_year` ∈ [2000, 2100].
+    fn assert_valid_listing(listing: &MarketListing) -> Result<(), CarbonError> {
+        if listing.listing_id.len() == 0  { return Err(CarbonError::ListingNotFound); }
+        if listing.batch_id.len() == 0    { return Err(CarbonError::ListingNotFound); }
+        if listing.project_id.len() == 0  { return Err(CarbonError::ListingNotFound); }
+        if listing.methodology.len() == 0 { return Err(CarbonError::ListingNotFound); }
+        if listing.country.len() == 0     { return Err(CarbonError::ListingNotFound); }
+        if listing.amount_available <= 0  { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if listing.price_per_credit <= 0  { return Err(CarbonError::PriceNotSet); }
+        if listing.vintage_year < 2000 || listing.vintage_year > 2100 {
+            return Err(CarbonError::InvalidVintageYear);
+        }
+        Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -598,5 +623,43 @@ mod tests {
         client.delist_credits(&seller, &s(&env, "list-001"));
         let l = client.get_listing(&s(&env, "list-001"));
         assert_eq!(l.status, ListingStatus::Delisted);
+    }
+
+    // ── Issue 2: Validation helper tests ──────────────────────────────────────
+
+    #[test]
+    fn test_list_credits_empty_methodology_fails() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        let result = client.try_list_credits(
+            &seller,
+            &s(&env, "list-bad"),
+            &s(&env, "batch-bad"),
+            &s(&env, "proj-bad"),
+            &10_i128,
+            &10_0000000_i128,
+            &2023_u32,
+            &s(&env, ""),    // empty methodology — invalid
+            &s(&env, "Brazil"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_credits_invalid_vintage_fails() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        let result = client.try_list_credits(
+            &seller,
+            &s(&env, "list-bad2"),
+            &s(&env, "batch-bad2"),
+            &s(&env, "proj-bad2"),
+            &10_i128,
+            &10_0000000_i128,
+            &1990_u32,  // out of range
+            &s(&env, "VCS"),
+            &s(&env, "Brazil"),
+        );
+        assert!(result.is_err());
     }
 }

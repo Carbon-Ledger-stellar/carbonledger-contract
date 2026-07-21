@@ -122,7 +122,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
 
         if env.storage().persistent().has(&DataKey::Project(project_id.clone())) {
             Self::release_lock(&env);
@@ -148,6 +148,10 @@ impl CarbonRegistryContract {
             vintage_year,
             created_at:            env.ledger().timestamp(),
         };
+        if let Err(e) = Self::assert_valid_project(&project) {
+            Self::release_lock(&env);
+            return Err(e);
+        }
         env.storage().persistent().set(&DataKey::Project(project_id.clone()), &project);
 
         env.events().publish(
@@ -172,7 +176,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         verifier_address.require_auth();
-        Self::require_verifier(&env, &verifier_address)?;
+        if let Err(e) = Self::require_verifier(&env, &verifier_address) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -205,7 +209,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         verifier_address.require_auth();
-        Self::require_verifier(&env, &verifier_address)?;
+        if let Err(e) = Self::require_verifier(&env, &verifier_address) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -238,7 +242,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         oracle_address.require_auth();
-        Self::require_oracle(&env, &oracle_address)?;
+        if let Err(e) = Self::require_oracle(&env, &oracle_address) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -270,7 +274,7 @@ impl CarbonRegistryContract {
         // ── checks ────────────────────────────────────────────────────────────
         Self::acquire_lock(&env)?;
         admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
 
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
@@ -306,14 +310,44 @@ impl CarbonRegistryContract {
     ) -> Result<(), CarbonError> {
         Self::acquire_lock(&env)?;
         oracle_address.require_auth();
-        Self::require_oracle(&env, &oracle_address)?;
+        if let Err(e) = Self::require_oracle(&env, &oracle_address) { Self::release_lock(&env); return Err(e); }
         let mut project = match Self::load_project(&env, &project_id) {
             Ok(p) => p,
             Err(e) => { Self::release_lock(&env); return Err(e); }
         };
         project.total_credits_issued += amount;
+        if let Err(e) = Self::assert_valid_project(&project) {
+            Self::release_lock(&env);
+            return Err(e);
+        }
         env.storage().persistent().set(&DataKey::Project(project_id), &project);
         Self::release_lock(&env);
+        Ok(())
+    }
+
+    // ── Validation helpers (Issue 2) ──────────────────────────────────────────
+
+    /// Assert that a [`CarbonProject`] satisfies all data-structure invariants:
+    /// - `project_id`, `name`, `methodology`, `country`, `project_type`,
+    ///   `metadata_cid` must be non-empty (len > 0).
+    /// - `vintage_year` ∈ [2000, 2100].
+    /// - `total_credits_issued` and `total_credits_retired` must be ≥ 0.
+    /// - `total_credits_retired` must be ≤ `total_credits_issued`.
+    fn assert_valid_project(project: &CarbonProject) -> Result<(), CarbonError> {
+        if project.project_id.len() == 0   { return Err(CarbonError::ProjectNotFound); }
+        if project.name.len() == 0         { return Err(CarbonError::ProjectNotFound); }
+        if project.methodology.len() == 0  { return Err(CarbonError::ProjectNotFound); }
+        if project.country.len() == 0      { return Err(CarbonError::ProjectNotFound); }
+        if project.project_type.len() == 0 { return Err(CarbonError::ProjectNotFound); }
+        if project.metadata_cid.len() == 0 { return Err(CarbonError::ProjectNotFound); }
+        if project.vintage_year < 2000 || project.vintage_year > 2100 {
+            return Err(CarbonError::InvalidVintageYear);
+        }
+        if project.total_credits_issued < 0  { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if project.total_credits_retired < 0 { return Err(CarbonError::ZeroAmountNotAllowed); }
+        if project.total_credits_retired > project.total_credits_issued {
+            return Err(CarbonError::InsufficientCredits);
+        }
         Ok(())
     }
 
@@ -678,5 +712,49 @@ mod tests {
             &make_str(&env, "forestry"),
             &2025_u32,
         );
+    }
+
+    // ── Issue 2: Validation helper tests ──────────────────────────────────────
+
+    #[test]
+    fn test_register_project_empty_name_fails() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+
+        let result = client.try_register_project(
+            &admin,
+            &make_str(&env, "proj-x"),
+            &make_str(&env, ""),  // empty name — invalid
+            &make_str(&env, "cid"),
+            &Address::generate(&env),
+            &make_str(&env, "VCS"),
+            &make_str(&env, "Brazil"),
+            &make_str(&env, "forestry"),
+            &2023_u32,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_register_project_invalid_vintage_fails() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+
+        let result = client.try_register_project(
+            &admin,
+            &make_str(&env, "proj-y"),
+            &make_str(&env, "Proj Y"),
+            &make_str(&env, "cid"),
+            &Address::generate(&env),
+            &make_str(&env, "VCS"),
+            &make_str(&env, "Brazil"),
+            &make_str(&env, "forestry"),
+            &1999_u32, // out of range
+        );
+        assert!(result.is_err());
     }
 }
