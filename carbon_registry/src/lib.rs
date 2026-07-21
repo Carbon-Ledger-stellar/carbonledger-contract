@@ -32,6 +32,33 @@ pub enum CarbonError {
     InvalidSerialRange    = 18,
     AlreadyInitialized    = 19,
     ReentrancyGuard       = 20,
+    ArithmeticOverflow    = 21,
+}
+
+// ── Checked-arithmetic helper ─────────────────────────────────────────────────
+//
+// Arithmetic safety (Issue 4): every add/sub/mul in this contract uses the
+// `checked_*` family and surfaces overflow/underflow as
+// [`CarbonError::ArithmeticOverflow`] instead of trapping the transaction.
+//
+// # Input-range assumptions
+// - `total_credits_issued` accumulates positive i128 amounts; assumed
+//   `< 1e15` per project (≈1 billion tonnes at 1e6 precision) with ample i128
+//   headroom, but the running total is still checked on every increment.
+// - Timestamps and time-lock delays are `u64`; `timestamp + delay` overflow is
+//   unreachable in practice but still checked.
+// - On overflow/underflow every guarded operation returns
+//   `CarbonError::ArithmeticOverflow`; none can wrap or panic-trap in release wasm.
+macro_rules! checked {
+    ($env:expr, $opt:expr) => {
+        match $opt {
+            Some(v) => v,
+            None => {
+                Self::release_lock($env);
+                return Err(CarbonError::ArithmeticOverflow);
+            }
+        }
+    };
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -323,7 +350,7 @@ impl CarbonRegistryContract {
         let delay = env.storage().persistent()
             .get::<DataKey, u64>(&DataKey::TimelockDelay)
             .unwrap_or(TIMELOCK_DEFAULT_DELAY_SECS);
-        let eta = env.ledger().timestamp() + delay;
+        let eta = checked!(&env, env.ledger().timestamp().checked_add(delay));
 
         let op = PendingOp {
             op_id: op_id.clone(),
@@ -537,7 +564,8 @@ impl CarbonRegistryContract {
             Ok(p) => p,
             Err(e) => { Self::release_lock(&env); return Err(e); }
         };
-        project.total_credits_issued += amount;
+        project.total_credits_issued =
+            checked!(&env, project.total_credits_issued.checked_add(amount));
         if let Err(e) = Self::assert_valid_project(&project) {
             Self::release_lock(&env);
             return Err(e);
@@ -943,7 +971,7 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
 
         let result = client.try_register_project(
             &admin,
@@ -964,7 +992,7 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
 
         let result = client.try_register_project(
             &admin,
@@ -987,13 +1015,13 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
         register(&env, &client, &admin);
 
         client.propose_suspend_project(
             &admin, &make_str(&env, "op-001"), &make_str(&env, "proj-001"), &make_str(&env, "investigation"),
-        ).unwrap();
-        let op = client.get_pending_op(&make_str(&env, "op-001")).unwrap();
+        );
+        let op = client.get_pending_op(&make_str(&env, "op-001"));
         assert_eq!(op.op_id, make_str(&env, "op-001"));
         assert_eq!(op.target, make_str(&env, "proj-001"));
     }
@@ -1004,7 +1032,7 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
         register(&env, &client, &admin);
 
         env.ledger().set(LedgerInfo {
@@ -1014,7 +1042,7 @@ mod tests {
         });
         client.propose_suspend_project(
             &admin, &make_str(&env, "op-002"), &make_str(&env, "proj-001"), &make_str(&env, "test"),
-        ).unwrap();
+        );
         let result = client.try_execute_suspend_project(&admin, &make_str(&env, "op-002"));
         assert!(result.is_err());
     }
@@ -1025,7 +1053,7 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
         register(&env, &client, &admin);
 
         env.ledger().set(LedgerInfo {
@@ -1035,14 +1063,14 @@ mod tests {
         });
         client.propose_suspend_project(
             &admin, &make_str(&env, "op-003"), &make_str(&env, "proj-001"), &make_str(&env, "audit"),
-        ).unwrap();
+        );
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.execute_suspend_project(&admin, &make_str(&env, "op-003")).unwrap();
-        let p = client.get_project(&make_str(&env, "proj-001")).unwrap();
+        client.execute_suspend_project(&admin, &make_str(&env, "op-003"));
+        let p = client.get_project(&make_str(&env, "proj-001"));
         assert_eq!(p.status, ProjectStatus::Suspended);
     }
 
@@ -1052,7 +1080,7 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
         register(&env, &client, &admin);
 
         env.ledger().set(LedgerInfo {
@@ -1062,9 +1090,9 @@ mod tests {
         });
         client.propose_suspend_project(
             &admin, &make_str(&env, "op-004"), &make_str(&env, "proj-001"), &make_str(&env, "contested"),
-        ).unwrap();
+        );
         let user = Address::generate(&env);
-        client.contest_operation(&user, &make_str(&env, "op-004"), &make_str(&env, "unjustified")).unwrap();
+        client.contest_operation(&user, &make_str(&env, "op-004"), &make_str(&env, "unjustified"));
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
@@ -1079,13 +1107,13 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
         register(&env, &client, &admin);
 
         client.propose_suspend_project(
             &admin, &make_str(&env, "op-005"), &make_str(&env, "proj-001"), &make_str(&env, "rollback"),
-        ).unwrap();
-        client.rollback_operation(&admin, &make_str(&env, "op-005")).unwrap();
+        );
+        client.rollback_operation(&admin, &make_str(&env, "op-005"));
         assert!(client.try_get_pending_op(&make_str(&env, "op-005")).is_err());
     }
 
@@ -1094,8 +1122,8 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
-        client.set_timelock_delay(&admin, &3600_u64).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
+        client.set_timelock_delay(&admin, &3600_u64);
         assert!(client.try_set_timelock_delay(&admin, &0_u64).is_err());
     }
 
@@ -1104,11 +1132,53 @@ mod tests {
         let (env, admin, oracle, verifier) = setup();
         let contract_id = env.register_contract(None, CarbonRegistryContract);
         let client = CarbonRegistryContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]);
         register(&env, &client, &admin);
         let rogue = Address::generate(&env);
         assert!(client.try_propose_suspend_project(
             &rogue, &make_str(&env, "op-bad"), &make_str(&env, "proj-001"), &make_str(&env, "hack"),
         ).is_err());
+    }
+
+    // ── Issue 4: Arithmetic safety / boundary tests ───────────────────────────
+
+    fn fresh(env: &Env) -> (CarbonRegistryContractClient<'static>, Address, Address) {
+        let admin    = Address::generate(env);
+        let oracle   = Address::generate(env);
+        let verifier = Address::generate(env);
+        let id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(env, &id);
+        client.initialize(&admin, &oracle, &vec![env, verifier.clone()]);
+        (client, admin, oracle)
+    }
+
+    /// `total_credits_issued += amount` accumulating past i128::MAX must return
+    /// `ArithmeticOverflow` rather than trapping.
+    #[test]
+    fn test_increment_issued_overflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, oracle) = fresh(&env);
+        register(&env, &client, &admin);
+        // First increment to the maximum is fine.
+        client.increment_issued(&oracle, &make_str(&env, "proj-001"), &i128::MAX);
+        let p = client.get_project(&make_str(&env, "proj-001"));
+        assert_eq!(p.total_credits_issued, i128::MAX);
+        // One more credit overflows the accumulator.
+        let res = client.try_increment_issued(&oracle, &make_str(&env, "proj-001"), &1_i128);
+        assert_eq!(res, Err(Ok(CarbonError::ArithmeticOverflow)));
+    }
+
+    /// Typical increments accumulate correctly through the checked add path.
+    #[test]
+    fn test_increment_issued_typical() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, oracle) = fresh(&env);
+        register(&env, &client, &admin);
+        client.increment_issued(&oracle, &make_str(&env, "proj-001"), &1_000_i128);
+        client.increment_issued(&oracle, &make_str(&env, "proj-001"), &2_500_i128);
+        let p = client.get_project(&make_str(&env, "proj-001"));
+        assert_eq!(p.total_credits_issued, 3_500);
     }
 }

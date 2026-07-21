@@ -33,6 +33,33 @@ pub enum CarbonError {
     InvalidSerialRange     = 18,
     AlreadyInitialized     = 19,
     ReentrancyGuard        = 20,
+    ArithmeticOverflow     = 21,
+}
+
+// ── Checked-arithmetic helper ─────────────────────────────────────────────────
+//
+// Arithmetic safety (Issue 4): every add/sub/mul in this contract uses the
+// `checked_*` family and surfaces overflow/underflow as
+// [`CarbonError::ArithmeticOverflow`] instead of trapping the transaction.
+//
+// # Input-range assumptions
+// - `price_per_credit` and `amount` are positive i128 values; the product
+//   `price_per_credit * amount` is the primary overflow risk and is always checked.
+// - `fee_bps` ∈ [1, 10_000]; `total_cost * fee_bps` stays within i128 for any
+//   realistic price/amount, but is still checked.
+// - Credit amounts are assumed `< 1e15` (≈1 billion tonnes at 1e6 precision).
+// - On overflow/underflow every guarded operation returns
+//   `CarbonError::ArithmeticOverflow`; none can wrap or panic-trap in release wasm.
+macro_rules! checked {
+    ($env:expr, $opt:expr) => {
+        match $opt {
+            Some(v) => v,
+            None => {
+                Self::release_lock($env);
+                return Err(CarbonError::ArithmeticOverflow);
+            }
+        }
+    };
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -261,14 +288,15 @@ impl CarbonMarketplaceContract {
         }
 
         // ── effects ───────────────────────────────────────────────────────────
-        let total_cost = listing.price_per_credit * amount;
+        let total_cost = checked!(&env, listing.price_per_credit.checked_mul(amount));
         let fee_bps: i128 = env.storage().persistent()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS);
-        let protocol_fee = total_cost * fee_bps / 10_000;
-        let seller_proceeds = total_cost - protocol_fee;
+        // `/ 10_000` is safe (non-zero constant); only the mul can overflow.
+        let protocol_fee = checked!(&env, total_cost.checked_mul(fee_bps)) / 10_000;
+        let seller_proceeds = checked!(&env, total_cost.checked_sub(protocol_fee));
 
-        listing.amount_available -= amount;
+        listing.amount_available = checked!(&env, listing.amount_available.checked_sub(amount));
         listing.status = if listing.amount_available == 0 {
             ListingStatus::Sold
         } else {
@@ -328,14 +356,15 @@ impl CarbonMarketplaceContract {
                 Self::release_lock(&env); return Err(CarbonError::InsufficientLiquidity);
             }
 
-            let total_cost = listing.price_per_credit * amount;
+            let total_cost = checked!(&env, listing.price_per_credit.checked_mul(amount));
             let fee_bps: i128 = env.storage().persistent()
                 .get(&DataKey::ProtocolFeeBps)
                 .unwrap_or(DEFAULT_PROTOCOL_FEE_BPS);
-            let protocol_fee = total_cost * fee_bps / 10_000;
-            let seller_proceeds = total_cost - protocol_fee;
+            // `/ 10_000` is safe (non-zero constant); only the mul can overflow.
+            let protocol_fee = checked!(&env, total_cost.checked_mul(fee_bps)) / 10_000;
+            let seller_proceeds = checked!(&env, total_cost.checked_sub(protocol_fee));
 
-            listing.amount_available -= amount;
+            listing.amount_available = checked!(&env, listing.amount_available.checked_sub(amount));
             listing.status = if listing.amount_available == 0 {
                 ListingStatus::Sold
             } else {
@@ -398,7 +427,7 @@ impl CarbonMarketplaceContract {
         let op = PendingOp {
             op_id: op_id.clone(), action: GovAction::UpdateFee,
             target: String::from_str(&env, "protocol_fee"), initiated_by: admin.clone(),
-            eta: env.ledger().timestamp() + delay, payload: String::from_str(&env, "fee_update"),
+            eta: checked!(&env, env.ledger().timestamp().checked_add(delay)), payload: String::from_str(&env, "fee_update"),
         };
         env.storage().persistent().set(&DataKey::TimelockOp(op_id.clone()), &op);
         // Stage the proposed fee — activated on execute
@@ -821,8 +850,8 @@ mod tests {
     fn test_propose_fee_update_and_query() {
         let env = Env::default();
         let (client, admin, _, _) = setup(&env);
-        client.propose_update_fee(&admin, &s(&env, "op-001"), &200_i128).unwrap();
-        let op = client.get_pending_op(&s(&env, "op-001")).unwrap();
+        client.propose_update_fee(&admin, &s(&env, "op-001"), &200_i128);
+        let op = client.get_pending_op(&s(&env, "op-001"));
         assert_eq!(op.op_id, s(&env, "op-001"));
     }
 
@@ -836,7 +865,7 @@ mod tests {
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.propose_update_fee(&admin, &s(&env, "op-002"), &200_i128).unwrap();
+        client.propose_update_fee(&admin, &s(&env, "op-002"), &200_i128);
         assert!(client.try_execute_update_fee(&admin, &s(&env, "op-002")).is_err());
     }
 
@@ -850,13 +879,13 @@ mod tests {
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.propose_update_fee(&admin, &s(&env, "op-003"), &200_i128).unwrap();
+        client.propose_update_fee(&admin, &s(&env, "op-003"), &200_i128);
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.execute_update_fee(&admin, &s(&env, "op-003")).unwrap();
+        client.execute_update_fee(&admin, &s(&env, "op-003"));
         assert!(client.try_get_pending_op(&s(&env, "op-003")).is_err());
     }
 
@@ -870,9 +899,9 @@ mod tests {
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.propose_update_fee(&admin, &s(&env, "op-004"), &500_i128).unwrap();
+        client.propose_update_fee(&admin, &s(&env, "op-004"), &500_i128);
         let user = Address::generate(&env);
-        client.contest_operation(&user, &s(&env, "op-004"), &s(&env, "fee too high")).unwrap();
+        client.contest_operation(&user, &s(&env, "op-004"), &s(&env, "fee too high"));
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
@@ -885,8 +914,8 @@ mod tests {
     fn test_rollback_fee_update() {
         let env = Env::default();
         let (client, admin, _, _) = setup(&env);
-        client.propose_update_fee(&admin, &s(&env, "op-005"), &200_i128).unwrap();
-        client.rollback_operation(&admin, &s(&env, "op-005")).unwrap();
+        client.propose_update_fee(&admin, &s(&env, "op-005"), &200_i128);
+        client.rollback_operation(&admin, &s(&env, "op-005"));
         assert!(client.try_get_pending_op(&s(&env, "op-005")).is_err());
     }
 
@@ -896,5 +925,74 @@ mod tests {
         let (client, _, _, _) = setup(&env);
         let rogue = Address::generate(&env);
         assert!(client.try_propose_update_fee(&rogue, &s(&env, "op-bad"), &200_i128).is_err());
+    }
+
+    // ── Issue 4: Arithmetic safety / boundary tests ───────────────────────────
+
+    fn list_at(env: &Env, client: &CarbonMarketplaceContractClient, seller: &Address, id: &str, amount: i128, price: i128) {
+        client.list_credits(
+            seller, &s(env, id), &s(env, "batch"), &s(env, "proj-001"),
+            &amount, &price, &2023_u32, &s(env, "VCS"), &s(env, "Brazil"),
+        );
+    }
+
+    /// `price_per_credit * amount` overflowing i128 must return a typed error
+    /// (before any token transfer), not trap the transaction.
+    #[test]
+    fn test_purchase_total_cost_mul_overflow() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        list_at(&env, &client, &seller, "list-of", i128::MAX, i128::MAX);
+        let buyer = Address::generate(&env);
+        // 2 <= amount_available (MAX); total_cost = MAX * 2 overflows.
+        let res = client.try_purchase_credits(&buyer, &s(&env, "list-of"), &2_i128);
+        assert_eq!(res, Err(Ok(CarbonError::ArithmeticOverflow)));
+    }
+
+    /// `total_cost * fee_bps` overflowing i128 (even when the product with amount
+    /// fits) must also surface `ArithmeticOverflow`.
+    #[test]
+    fn test_purchase_fee_mul_overflow() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        // total_cost = (MAX/2) * 1 = MAX/2; * fee_bps (100) overflows.
+        list_at(&env, &client, &seller, "list-fee", i128::MAX, i128::MAX / 2);
+        let buyer = Address::generate(&env);
+        let res = client.try_purchase_credits(&buyer, &s(&env, "list-fee"), &1_i128);
+        assert_eq!(res, Err(Ok(CarbonError::ArithmeticOverflow)));
+    }
+
+    /// A typical funded purchase settles correctly: seller receives proceeds,
+    /// admin receives the 1% protocol fee, and the checked math matches hand-calc.
+    #[test]
+    fn test_typical_purchase_fee_split_ok() {
+        let env = Env::default();
+        let (client, admin, seller, usdc) = setup(&env);
+        // 100 credits @ 10 USDC (stroops). Buy 10 → total 100 USDC; fee 1% = 1 USDC.
+        add_listing(&env, &client, &seller);
+        let buyer = Address::generate(&env);
+        let sac = token::StellarAssetClient::new(&env, &usdc);
+        sac.mint(&buyer, &1_000_0000000_i128);
+
+        client.purchase_credits(&buyer, &s(&env, "list-001"), &10_i128);
+
+        let tok = token::Client::new(&env, &usdc);
+        let total = 10_i128 * 10_0000000_i128;      // 100 USDC
+        let fee = total / 100;                        // 1% = 1 USDC
+        assert_eq!(tok.balance(&seller), total - fee);
+        assert_eq!(tok.balance(&admin), fee);
+        let l = client.get_listing(&s(&env, "list-001"));
+        assert_eq!(l.amount_available, 90);
+    }
+
+    /// Zero amount is rejected before any arithmetic.
+    #[test]
+    fn test_purchase_zero_amount_rejected() {
+        let env = Env::default();
+        let (client, _, seller, _) = setup(&env);
+        add_listing(&env, &client, &seller);
+        let buyer = Address::generate(&env);
+        let res = client.try_purchase_credits(&buyer, &s(&env, "list-001"), &0_i128);
+        assert_eq!(res, Err(Ok(CarbonError::ZeroAmountNotAllowed)));
     }
 }
