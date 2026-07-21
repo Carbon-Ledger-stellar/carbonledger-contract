@@ -32,6 +32,36 @@ pub enum CarbonError {
     InvalidSerialRange     = 18,
     AlreadyInitialized     = 19,
     ReentrancyGuard        = 20,
+    ArithmeticOverflow     = 21,
+}
+
+// ── Checked-arithmetic helper ─────────────────────────────────────────────────
+//
+// Arithmetic safety (Issue 4): every add/sub/mul in this contract uses the
+// `checked_*` family and surfaces overflow/underflow as
+// [`CarbonError::ArithmeticOverflow`] instead of trapping the transaction.
+//
+// The `checked!` macro unwraps an `Option` produced by a `checked_*` call while
+// honouring the reentrancy guard: on `None` it releases the lock and returns the
+// typed error, matching the existing `Ok/Err(release_lock)` pattern used across
+// the mutating entry points.
+//
+// # Input-range assumptions
+// - Credit `amount` values are assumed `< 1e15` (≈1 billion tonnes at 1e6
+//   precision); i128 has ample headroom, but all operations are still checked.
+// - Serial numbers are `u64`; ranges are validated so `serial_end >= serial_start`.
+// - On overflow/underflow every guarded operation returns
+//   `CarbonError::ArithmeticOverflow`; none can wrap or panic-trap in release wasm.
+macro_rules! checked {
+    ($env:expr, $opt:expr) => {
+        match $opt {
+            Some(v) => v,
+            None => {
+                Self::release_lock($env);
+                return Err(CarbonError::ArithmeticOverflow);
+            }
+        }
+    };
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -269,7 +299,10 @@ impl CarbonCreditContract {
         if batch.status == CreditStatus::FullyRetired { Self::release_lock(&env); return Err(CarbonError::AlreadyRetired); }
         if batch.status == CreditStatus::Suspended { Self::release_lock(&env); return Err(CarbonError::ProjectSuspended); }
 
-        let active_amount = Self::active_amount(&env, &batch);
+        let active_amount = match Self::active_amount(&env, &batch) {
+            Ok(a) => a,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
         if amount > active_amount { Self::release_lock(&env); return Err(CarbonError::InsufficientCredits); }
 
         // ── effects ───────────────────────────────────────────────────────────
@@ -280,21 +313,27 @@ impl CarbonCreditContract {
             .get(&RetiredKey::BatchRetired(batch_id.clone()))
             .unwrap_or(0i128);
 
-        let retire_serial_start = batch.serial_start + already_retired as u64;
-        let retire_serial_end   = retire_serial_start + amount as u64 - 1;
+        // Serial slice: [start, start + (amount - 1)]. Checked so a batch minted at
+        // the top of the u64 range cannot overflow when computing the end serial.
+        // `amount - 1` is computed first (amount >= 1 here) to avoid a spurious
+        // intermediate overflow when the slice ends exactly at u64::MAX.
+        let retire_serial_start = checked!(&env, batch.serial_start.checked_add(already_retired as u64));
+        let retire_serial_end   = checked!(&env, retire_serial_start.checked_add((amount - 1) as u64));
 
         let mut serial_numbers: Vec<u64> = vec![&env];
         let mut s = retire_serial_start;
-        while s <= retire_serial_end {
+        loop {
             serial_numbers.push_back(s);
-            s += 1;
+            if s == retire_serial_end { break; }
+            // Cannot overflow: s < retire_serial_end <= u64::MAX here.
+            s = checked!(&env, s.checked_add(1));
         }
 
         // Update batch status — track retired amount persistently
-        let new_retired = already_retired + amount;
+        let new_retired = checked!(&env, already_retired.checked_add(amount));
         env.storage().persistent().set(&RetiredKey::BatchRetired(batch_id.clone()), &new_retired);
 
-        let new_active = batch.amount - new_retired;
+        let new_active = checked!(&env, batch.amount.checked_sub(new_retired));
         batch.status = if new_active == 0 {
             CreditStatus::FullyRetired
         } else {
@@ -353,7 +392,10 @@ impl CarbonCreditContract {
         if batch.status == CreditStatus::FullyRetired { Self::release_lock(&env); return Err(CarbonError::AlreadyRetired); }
         if batch.status == CreditStatus::Suspended { Self::release_lock(&env); return Err(CarbonError::ProjectSuspended); }
 
-        let active = Self::active_amount(&env, &batch);
+        let active = match Self::active_amount(&env, &batch) {
+            Ok(a) => a,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
         if amount > active { Self::release_lock(&env); return Err(CarbonError::InsufficientCredits); }
 
         // ── effects ───────────────────────────────────────────────────────────
@@ -417,7 +459,7 @@ impl CarbonCreditContract {
         let op = PendingOp {
             op_id: op_id.clone(), action: GovAction::PauseContract,
             target: String::from_str(&env, "contract"), initiated_by: admin.clone(),
-            eta: env.ledger().timestamp() + delay, payload: reason.clone(),
+            eta: checked!(&env, env.ledger().timestamp().checked_add(delay)), payload: reason.clone(),
         };
         env.storage().persistent().set(&DataKey::TimelockOp(op_id.clone()), &op);
         env.events().publish((symbol_short!("c_ledger"), symbol_short!("tl_queue")), (op_id, admin, reason));
@@ -522,7 +564,12 @@ impl CarbonCreditContract {
             return Err(CarbonError::InvalidVintageYear);
         }
         if batch.serial_end < batch.serial_start { return Err(CarbonError::InvalidSerialRange); }
-        let range_len = (batch.serial_end - batch.serial_start + 1) as i128;
+        // `end - start` cannot underflow (checked above); the `+1` is checked so a
+        // range ending at u64::MAX reports overflow instead of trapping.
+        let span = batch.serial_end - batch.serial_start;
+        let range_len = span
+            .checked_add(1)
+            .ok_or(CarbonError::ArithmeticOverflow)? as i128;
         if range_len != batch.amount { return Err(CarbonError::InvalidSerialRange); }
         Ok(())
     }
@@ -566,16 +613,20 @@ impl CarbonCreditContract {
     }
 
     /// Returns the number of credits in a batch that have not yet been retired.
-    fn active_amount(env: &Env, batch: &CreditBatch) -> i128 {
+    ///
+    /// Uses `checked_sub`; the retired counter is an invariant `<= batch.amount`,
+    /// so underflow signals corrupted state and returns
+    /// [`CarbonError::ArithmeticOverflow`] rather than trapping.
+    fn active_amount(env: &Env, batch: &CreditBatch) -> Result<i128, CarbonError> {
         if batch.status == CreditStatus::FullyRetired {
-            return 0;
+            return Ok(0);
         }
         let retired: i128 = env
             .storage()
             .persistent()
             .get(&RetiredKey::BatchRetired(batch.batch_id.clone()))
             .unwrap_or(0i128);
-        batch.amount - retired
+        batch.amount.checked_sub(retired).ok_or(CarbonError::ArithmeticOverflow)
     }
 
     fn verify_serial_range_internal(env: &Env, start: u64, end: u64) -> bool {
@@ -938,7 +989,7 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
         // amount=100 but serial range 1..=50 — only 50 serials, mismatch
         let result = c.try_mint_credits(
@@ -962,7 +1013,7 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
 
         let result = c.try_mint_credits(
             &admin, &s(&env, "p1"), &100_i128, &2023_u32,
@@ -981,9 +1032,9 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
-        c.propose_pause(&admin, &s(&env, "op-001"), &s(&env, "maintenance")).unwrap();
-        let op = c.get_pending_op(&s(&env, "op-001")).unwrap();
+        c.initialize(&admin, &registry);
+        c.propose_pause(&admin, &s(&env, "op-001"), &s(&env, "maintenance"));
+        let op = c.get_pending_op(&s(&env, "op-001"));
         assert_eq!(op.op_id, s(&env, "op-001"));
     }
 
@@ -996,13 +1047,13 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        c.propose_pause(&admin, &s(&env, "op-002"), &s(&env, "test")).unwrap();
+        c.propose_pause(&admin, &s(&env, "op-002"), &s(&env, "test"));
         assert!(c.try_execute_pause(&admin, &s(&env, "op-002")).is_err());
     }
 
@@ -1015,19 +1066,19 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        c.propose_pause(&admin, &s(&env, "op-003"), &s(&env, "upgrade")).unwrap();
+        c.propose_pause(&admin, &s(&env, "op-003"), &s(&env, "upgrade"));
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        c.execute_pause(&admin, &s(&env, "op-003")).unwrap();
+        c.execute_pause(&admin, &s(&env, "op-003"));
         assert!(c.try_get_pending_op(&s(&env, "op-003")).is_err());
     }
 
@@ -1040,15 +1091,15 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        c.propose_pause(&admin, &s(&env, "op-004"), &s(&env, "contested")).unwrap();
+        c.propose_pause(&admin, &s(&env, "op-004"), &s(&env, "contested"));
         let user = Address::generate(&env);
-        c.contest_operation(&user, &s(&env, "op-004"), &s(&env, "unjustified")).unwrap();
+        c.contest_operation(&user, &s(&env, "op-004"), &s(&env, "unjustified"));
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
@@ -1065,9 +1116,9 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
-        c.propose_pause(&admin, &s(&env, "op-005"), &s(&env, "rollback")).unwrap();
-        c.rollback_operation(&admin, &s(&env, "op-005")).unwrap();
+        c.initialize(&admin, &registry);
+        c.propose_pause(&admin, &s(&env, "op-005"), &s(&env, "rollback"));
+        c.rollback_operation(&admin, &s(&env, "op-005"));
         assert!(c.try_get_pending_op(&s(&env, "op-005")).is_err());
     }
 
@@ -1079,8 +1130,100 @@ mod tests {
         let registry = Address::generate(&env);
         let id = env.register_contract(None, CarbonCreditContract);
         let c = CarbonCreditContractClient::new(&env, &id);
-        c.initialize(&admin, &registry).unwrap();
+        c.initialize(&admin, &registry);
         let rogue = Address::generate(&env);
         assert!(c.try_propose_pause(&rogue, &s(&env, "op-bad"), &s(&env, "hack")).is_err());
+    }
+
+    // ── Issue 4: Arithmetic safety / boundary tests ───────────────────────────
+
+    /// Helper: fresh contract with a fresh admin.
+    fn fresh(env: &Env) -> (CarbonCreditContractClient<'static>, Address) {
+        let admin = Address::generate(env);
+        let registry = Address::generate(env);
+        let id = env.register_contract(None, CarbonCreditContract);
+        let c = CarbonCreditContractClient::new(env, &id);
+        c.initialize(&admin, &registry);
+        (c, admin)
+    }
+
+    /// Minting a batch whose serial range ends at `u64::MAX` starting from 0 would
+    /// overflow `serial_end - serial_start + 1`. It must return a typed error, not trap.
+    #[test]
+    fn test_mint_serial_span_overflow_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, admin) = fresh(&env);
+        // span = u64::MAX - 0, `+ 1` overflows u64.
+        let res = c.try_mint_credits(
+            &admin, &s(&env, "p1"), &1_i128, &2023_u32, &s(&env, "b-of"),
+            &0_u64, &u64::MAX, &s(&env, "cid"),
+        );
+        assert_eq!(res, Err(Ok(CarbonError::ArithmeticOverflow)));
+    }
+
+    /// A batch minted at the very top of the u64 serial space must still mint and
+    /// retire cleanly (checked math yields the exact boundary, no overflow).
+    #[test]
+    fn test_retire_at_u64_serial_boundary_ok() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, admin) = fresh(&env);
+        // serial_start = MAX-1, serial_end = MAX, amount = 2, span+1 = 2. No overflow.
+        c.mint_credits(
+            &admin, &s(&env, "p1"), &2_i128, &2023_u32, &s(&env, "b-top"),
+            &(u64::MAX - 1), &u64::MAX, &s(&env, "cid"),
+        );
+        let holder = Address::generate(&env);
+        let cert = c.retire_credits(
+            &holder, &s(&env, "b-top"), &2_i128, &s(&env, "reason"),
+            &s(&env, "Corp"), &s(&env, "ret-top"), &s(&env, "tx"),
+        );
+        assert_eq!(cert.amount, 2);
+        assert_eq!(cert.serial_numbers.len(), 2);
+        // Serials are exactly [u64::MAX-1, u64::MAX].
+        assert_eq!(cert.serial_numbers.get(0).unwrap(), u64::MAX - 1);
+        assert_eq!(cert.serial_numbers.get(1).unwrap(), u64::MAX);
+    }
+
+    /// Zero and negative amounts are rejected before any arithmetic runs.
+    #[test]
+    fn test_zero_and_negative_amounts_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, admin) = fresh(&env);
+        let zero = c.try_mint_credits(
+            &admin, &s(&env, "p1"), &0_i128, &2023_u32, &s(&env, "b0"),
+            &1_u64, &1_u64, &s(&env, "cid"),
+        );
+        assert_eq!(zero, Err(Ok(CarbonError::ZeroAmountNotAllowed)));
+        let neg = c.try_mint_credits(
+            &admin, &s(&env, "p1"), &(-5_i128), &2023_u32, &s(&env, "bn"),
+            &1_u64, &1_u64, &s(&env, "cid"),
+        );
+        assert_eq!(neg, Err(Ok(CarbonError::ZeroAmountNotAllowed)));
+    }
+
+    /// A multi-slice retirement exercises the checked i128 add/sub paths
+    /// (`already_retired + amount`, `batch.amount - new_retired`) across two
+    /// partial retirements that together consume the whole batch. Amount is kept
+    /// modest because each retired credit materialises one serial number.
+    #[test]
+    fn test_partial_then_full_retirement_math_ok() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (c, admin) = fresh(&env);
+        let total: i128 = 100;
+        c.mint_credits(
+            &admin, &s(&env, "p1"), &total, &2023_u32, &s(&env, "b-big"),
+            &1_u64, &(total as u64), &s(&env, "cid"),
+        );
+        let holder = Address::generate(&env);
+        c.retire_credits(&holder, &s(&env, "b-big"), &(total / 2), &s(&env, "r"), &s(&env, "Corp"), &s(&env, "ret-1"), &s(&env, "tx1"));
+        let b = c.get_credit_batch(&s(&env, "b-big"));
+        assert_eq!(b.status, CreditStatus::PartiallyRetired);
+        c.retire_credits(&holder, &s(&env, "b-big"), &(total / 2), &s(&env, "r"), &s(&env, "Corp"), &s(&env, "ret-2"), &s(&env, "tx2"));
+        let b = c.get_credit_batch(&s(&env, "b-big"));
+        assert_eq!(b.status, CreditStatus::FullyRetired);
     }
 }

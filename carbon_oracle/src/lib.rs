@@ -32,6 +32,31 @@ pub enum CarbonError {
     InvalidSerialRange     = 18,
     AlreadyInitialized     = 19,
     ReentrancyGuard        = 20,
+    ArithmeticOverflow     = 21,
+}
+
+// ── Checked-arithmetic helper ─────────────────────────────────────────────────
+//
+// Arithmetic safety (Issue 4): every add/sub/mul in this contract uses the
+// `checked_*` family and surfaces overflow/underflow as
+// [`CarbonError::ArithmeticOverflow`] instead of trapping the transaction.
+//
+// # Input-range assumptions
+// - Timestamps and time-lock delays are `u64`; `timestamp + delay` overflow is
+//   unreachable in practice but still checked.
+// - Monitoring-freshness math uses `saturating_sub` (cannot underflow).
+// - On overflow/underflow every guarded operation returns
+//   `CarbonError::ArithmeticOverflow`; none can wrap or panic-trap in release wasm.
+macro_rules! checked {
+    ($env:expr, $opt:expr) => {
+        match $opt {
+            Some(v) => v,
+            None => {
+                Self::release_lock($env);
+                return Err(CarbonError::ArithmeticOverflow);
+            }
+        }
+    };
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -314,7 +339,7 @@ impl CarbonOracleContract {
         let op = PendingOp {
             op_id: op_id.clone(), action: GovAction::UpdateCreditPrice,
             target: methodology.clone(), initiated_by: oracle_signer.clone(),
-            eta: env.ledger().timestamp() + delay, payload: String::from_str(&env, "price_update"),
+            eta: checked!(&env, env.ledger().timestamp().checked_add(delay)), payload: String::from_str(&env, "price_update"),
         };
         env.storage().persistent().set(&DataKey::TimelockOp(op_id.clone()), &op);
         // Stage price in temp storage so it's ready on execute
@@ -722,8 +747,8 @@ mod tests {
     fn test_propose_price_update_and_query() {
         let env = Env::default();
         let (client, _, oracle) = setup(&env);
-        client.propose_price_update(&oracle, &s(&env, "op-001"), &s(&env, "VCS"), &2023_u32, &20_0000000_i128).unwrap();
-        let op = client.get_pending_op(&s(&env, "op-001")).unwrap();
+        client.propose_price_update(&oracle, &s(&env, "op-001"), &s(&env, "VCS"), &2023_u32, &20_0000000_i128);
+        let op = client.get_pending_op(&s(&env, "op-001"));
         assert_eq!(op.op_id, s(&env, "op-001"));
     }
 
@@ -737,7 +762,7 @@ mod tests {
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.propose_price_update(&oracle, &s(&env, "op-002"), &s(&env, "VCS"), &2023_u32, &20_0000000_i128).unwrap();
+        client.propose_price_update(&oracle, &s(&env, "op-002"), &s(&env, "VCS"), &2023_u32, &20_0000000_i128);
         assert!(client.try_execute_price_update(&oracle, &s(&env, "op-002")).is_err());
     }
 
@@ -751,13 +776,13 @@ mod tests {
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.propose_price_update(&oracle, &s(&env, "op-003"), &s(&env, "VCS"), &2024_u32, &25_0000000_i128).unwrap();
+        client.propose_price_update(&oracle, &s(&env, "op-003"), &s(&env, "VCS"), &2024_u32, &25_0000000_i128);
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.execute_price_update(&oracle, &s(&env, "op-003")).unwrap();
+        client.execute_price_update(&oracle, &s(&env, "op-003"));
         assert!(client.try_get_pending_op(&s(&env, "op-003")).is_err());
     }
 
@@ -771,9 +796,9 @@ mod tests {
             network_id: Default::default(), base_reserve: 10,
             min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
         });
-        client.propose_price_update(&oracle, &s(&env, "op-004"), &s(&env, "VCS"), &2023_u32, &50_0000000_i128).unwrap();
+        client.propose_price_update(&oracle, &s(&env, "op-004"), &s(&env, "VCS"), &2023_u32, &50_0000000_i128);
         let user = Address::generate(&env);
-        client.contest_operation(&user, &s(&env, "op-004"), &s(&env, "price spike")).unwrap();
+        client.contest_operation(&user, &s(&env, "op-004"), &s(&env, "price spike"));
         env.ledger().set(LedgerInfo {
             timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
             network_id: Default::default(), base_reserve: 10,
@@ -786,8 +811,39 @@ mod tests {
     fn test_rollback_price_update() {
         let env = Env::default();
         let (client, _, oracle) = setup(&env);
-        client.propose_price_update(&oracle, &s(&env, "op-005"), &s(&env, "VCS"), &2023_u32, &15_0000000_i128).unwrap();
-        client.rollback_operation(&oracle, &s(&env, "op-005")).unwrap();
+        client.propose_price_update(&oracle, &s(&env, "op-005"), &s(&env, "VCS"), &2023_u32, &15_0000000_i128);
+        client.rollback_operation(&oracle, &s(&env, "op-005"));
         assert!(client.try_get_pending_op(&s(&env, "op-005")).is_err());
+    }
+
+    // ── Issue 4: Arithmetic safety / boundary tests ───────────────────────────
+
+    /// When the ledger timestamp is at `u64::MAX`, `timestamp + delay` for the
+    /// time-lock ETA must return a typed error instead of trapping.
+    #[test]
+    fn test_propose_eta_timestamp_overflow() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        env.ledger().set(LedgerInfo {
+            timestamp: u64::MAX, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        let res = client.try_propose_price_update(
+            &oracle, &s(&env, "op-of"), &s(&env, "VCS"), &2023_u32, &20_0000000_i128,
+        );
+        assert_eq!(res, Err(Ok(CarbonError::ArithmeticOverflow)));
+    }
+
+    /// A non-positive price is rejected before any arithmetic runs.
+    #[test]
+    fn test_propose_zero_price_rejected() {
+        let env = Env::default();
+        let (client, _, oracle) = setup(&env);
+        let res = client.try_propose_price_update(
+            &oracle, &s(&env, "op-z"), &s(&env, "VCS"), &2023_u32, &0_i128,
+        );
+        assert_eq!(res, Err(Ok(CarbonError::ZeroAmountNotAllowed)));
     }
 }
