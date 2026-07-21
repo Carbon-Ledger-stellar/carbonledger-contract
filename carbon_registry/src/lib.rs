@@ -44,6 +44,10 @@ pub enum DataKey {
     OracleAddress,
     RegistryAdmin,
     Locked,
+    // Time-lock keys (Issue 3)
+    TimelockOp(String),      // op_id → PendingOp
+    TimelockContest(String), // op_id → ContestRecord
+    TimelockDelay,           // u64 seconds (default 172_800 = 48 h)
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -73,6 +77,42 @@ pub struct CarbonProject {
     pub status:                ProjectStatus,
     pub vintage_year:          u32,
     pub created_at:            u64,
+}
+
+// ── Time-lock types (Issue 3) ─────────────────────────────────────────────────
+
+/// Default delay: 48 hours in seconds.
+const TIMELOCK_DEFAULT_DELAY_SECS: u64 = 172_800;
+
+/// Governance operations subject to time-lock.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovAction {
+    SuspendProject,
+    UnsuspendProject,
+    ChangeTimelockDelay,
+}
+
+/// A pending governance operation waiting out its delay period.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingOp {
+    pub op_id:        String,
+    pub action:       GovAction,
+    pub target:       String,    // project_id or parameter name
+    pub initiated_by: Address,
+    pub eta:          u64,       // earliest execution timestamp (seconds)
+    pub payload:      String,    // human-readable reason / new value
+}
+
+/// Record of a contest raised against a pending operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContestRecord {
+    pub op_id:        String,
+    pub contested_by: Address,
+    pub reason:       String,
+    pub contested_at: u64,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -261,7 +301,189 @@ impl CarbonRegistryContract {
         Ok(())
     }
 
-    /// Admin suspends a project under investigation, halting new credit issuance.
+    /// Propose a suspension of a project under investigation.
+    /// The operation is queued with a time-lock delay (default 48 h).
+    /// Execute via [`execute_suspend_project`] after the delay has elapsed.
+    ///
+    /// # Errors
+    /// - [`CarbonError::UnauthorizedVerifier`] if caller is not the admin.
+    /// - [`CarbonError::ProjectNotFound`] if `project_id` does not exist.
+    pub fn propose_suspend_project(
+        env: Env,
+        admin: Address,
+        op_id: String,
+        project_id: String,
+        reason: String,
+    ) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+        if let Err(e) = Self::load_project(&env, &project_id) { Self::release_lock(&env); return Err(e); }
+
+        let delay = env.storage().persistent()
+            .get::<DataKey, u64>(&DataKey::TimelockDelay)
+            .unwrap_or(TIMELOCK_DEFAULT_DELAY_SECS);
+        let eta = env.ledger().timestamp() + delay;
+
+        let op = PendingOp {
+            op_id: op_id.clone(),
+            action: GovAction::SuspendProject,
+            target: project_id.clone(),
+            initiated_by: admin.clone(),
+            eta,
+            payload: reason.clone(),
+        };
+        env.storage().persistent().set(&DataKey::TimelockOp(op_id.clone()), &op);
+        env.events().publish(
+            (symbol_short!("c_ledger"), symbol_short!("tl_queue")),
+            (op_id, admin, project_id, eta),
+        );
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Execute a previously queued suspend operation after its delay has elapsed.
+    ///
+    /// # Errors
+    /// - [`CarbonError::UnauthorizedVerifier`] if caller is not the admin.
+    /// - [`CarbonError::ProjectNotFound`] if op or project does not exist.
+    /// - [`CarbonError::RetirementIrreversible`] if delay not elapsed or op contested.
+    pub fn execute_suspend_project(
+        env: Env,
+        admin: Address,
+        op_id: String,
+    ) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+
+        let op: PendingOp = match env.storage().persistent().get(&DataKey::TimelockOp(op_id.clone())) {
+            Some(o) => o,
+            None => { Self::release_lock(&env); return Err(CarbonError::ProjectNotFound); }
+        };
+        if env.storage().persistent().has(&DataKey::TimelockContest(op_id.clone())) {
+            Self::release_lock(&env); return Err(CarbonError::RetirementIrreversible);
+        }
+        if env.ledger().timestamp() < op.eta {
+            Self::release_lock(&env); return Err(CarbonError::RetirementIrreversible);
+        }
+
+        let mut project = match Self::load_project(&env, &op.target) {
+            Ok(p) => p,
+            Err(e) => { Self::release_lock(&env); return Err(e); }
+        };
+        project.status = ProjectStatus::Suspended;
+        env.storage().persistent().set(&DataKey::Project(op.target.clone()), &project);
+        env.storage().persistent().remove(&DataKey::TimelockOp(op_id.clone()));
+        env.events().publish(
+            (symbol_short!("c_ledger"), symbol_short!("suspended")),
+            (op.target, admin, op.payload),
+        );
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Contest a pending governance operation during its delay window.
+    /// Any address may contest. A valid contest prevents execution.
+    ///
+    /// # Errors
+    /// - [`CarbonError::ProjectNotFound`] if the op does not exist.
+    /// - [`CarbonError::AlreadyRetired`] if the delay window has already closed.
+    pub fn contest_operation(
+        env: Env,
+        contestant: Address,
+        op_id: String,
+        reason: String,
+    ) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        contestant.require_auth();
+
+        let op: PendingOp = match env.storage().persistent().get(&DataKey::TimelockOp(op_id.clone())) {
+            Some(o) => o,
+            None => { Self::release_lock(&env); return Err(CarbonError::ProjectNotFound); }
+        };
+        if env.ledger().timestamp() >= op.eta {
+            Self::release_lock(&env); return Err(CarbonError::AlreadyRetired);
+        }
+        let record = ContestRecord {
+            op_id: op_id.clone(),
+            contested_by: contestant.clone(),
+            reason: reason.clone(),
+            contested_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::TimelockContest(op_id.clone()), &record);
+        env.events().publish(
+            (symbol_short!("c_ledger"), symbol_short!("tl_ctest")),
+            (op_id, contestant, reason),
+        );
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Roll back (cancel) a pending or contested operation. Admin only.
+    ///
+    /// # Errors
+    /// - [`CarbonError::UnauthorizedVerifier`] if caller is not the admin.
+    /// - [`CarbonError::ProjectNotFound`] if the op does not exist.
+    pub fn rollback_operation(
+        env: Env,
+        admin: Address,
+        op_id: String,
+    ) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+
+        if !env.storage().persistent().has(&DataKey::TimelockOp(op_id.clone())) {
+            Self::release_lock(&env); return Err(CarbonError::ProjectNotFound);
+        }
+        env.storage().persistent().remove(&DataKey::TimelockOp(op_id.clone()));
+        if env.storage().persistent().has(&DataKey::TimelockContest(op_id.clone())) {
+            env.storage().persistent().remove(&DataKey::TimelockContest(op_id.clone()));
+        }
+        env.events().publish(
+            (symbol_short!("c_ledger"), symbol_short!("tl_rback")),
+            (op_id, admin),
+        );
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Query a pending operation by ID.
+    pub fn get_pending_op(env: Env, op_id: String) -> Result<PendingOp, CarbonError> {
+        env.storage().persistent()
+            .get(&DataKey::TimelockOp(op_id))
+            .ok_or(CarbonError::ProjectNotFound)
+    }
+
+    /// Query the contest record for an op, if any.
+    pub fn get_contest(env: Env, op_id: String) -> Result<ContestRecord, CarbonError> {
+        env.storage().persistent()
+            .get(&DataKey::TimelockContest(op_id))
+            .ok_or(CarbonError::ProjectNotFound)
+    }
+
+    /// Update the time-lock delay in seconds. Admin only. Default is 172_800 (48 h).
+    ///
+    /// # Errors
+    /// - [`CarbonError::UnauthorizedVerifier`] if caller is not the admin.
+    /// - [`CarbonError::ZeroAmountNotAllowed`] if delay is zero.
+    pub fn set_timelock_delay(
+        env: Env,
+        admin: Address,
+        delay_secs: u64,
+    ) -> Result<(), CarbonError> {
+        Self::acquire_lock(&env)?;
+        admin.require_auth();
+        if let Err(e) = Self::require_admin(&env, &admin) { Self::release_lock(&env); return Err(e); }
+        if delay_secs == 0 { Self::release_lock(&env); return Err(CarbonError::ZeroAmountNotAllowed); }
+        env.storage().persistent().set(&DataKey::TimelockDelay, &delay_secs);
+        Self::release_lock(&env);
+        Ok(())
+    }
+
+    /// Admin suspends a project directly (retained for backward compatibility).
+    /// Prefer the time-locked propose/execute flow for production use.
     ///
     /// # Errors
     /// - [`CarbonError::ProjectNotFound`] if `project_id` does not exist.
@@ -756,5 +978,137 @@ mod tests {
             &1999_u32, // out of range
         );
         assert!(result.is_err());
+    }
+
+    // ── Issue 3: Time-lock tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_propose_and_query_pending_op() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        register(&env, &client, &admin);
+
+        client.propose_suspend_project(
+            &admin, &make_str(&env, "op-001"), &make_str(&env, "proj-001"), &make_str(&env, "investigation"),
+        ).unwrap();
+        let op = client.get_pending_op(&make_str(&env, "op-001")).unwrap();
+        assert_eq!(op.op_id, make_str(&env, "op-001"));
+        assert_eq!(op.target, make_str(&env, "proj-001"));
+    }
+
+    #[test]
+    fn test_execute_before_delay_fails() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        register(&env, &client, &admin);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_suspend_project(
+            &admin, &make_str(&env, "op-002"), &make_str(&env, "proj-001"), &make_str(&env, "test"),
+        ).unwrap();
+        let result = client.try_execute_suspend_project(&admin, &make_str(&env, "op-002"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_after_delay_succeeds() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        register(&env, &client, &admin);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_suspend_project(
+            &admin, &make_str(&env, "op-003"), &make_str(&env, "proj-001"), &make_str(&env, "audit"),
+        ).unwrap();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.execute_suspend_project(&admin, &make_str(&env, "op-003")).unwrap();
+        let p = client.get_project(&make_str(&env, "proj-001")).unwrap();
+        assert_eq!(p.status, ProjectStatus::Suspended);
+    }
+
+    #[test]
+    fn test_contest_blocks_execution() {
+        use soroban_sdk::testutils::{Ledger, LedgerInfo};
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        register(&env, &client, &admin);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000, protocol_version: 20, sequence_number: 100,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        client.propose_suspend_project(
+            &admin, &make_str(&env, "op-004"), &make_str(&env, "proj-001"), &make_str(&env, "contested"),
+        ).unwrap();
+        let user = Address::generate(&env);
+        client.contest_operation(&user, &make_str(&env, "op-004"), &make_str(&env, "unjustified")).unwrap();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000 + 172_800 + 1, protocol_version: 20, sequence_number: 200,
+            network_id: Default::default(), base_reserve: 10,
+            min_temp_entry_ttl: 1, min_persistent_entry_ttl: 1, max_entry_ttl: 6_312_000,
+        });
+        let result = client.try_execute_suspend_project(&admin, &make_str(&env, "op-004"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rollback_removes_op() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        register(&env, &client, &admin);
+
+        client.propose_suspend_project(
+            &admin, &make_str(&env, "op-005"), &make_str(&env, "proj-001"), &make_str(&env, "rollback"),
+        ).unwrap();
+        client.rollback_operation(&admin, &make_str(&env, "op-005")).unwrap();
+        assert!(client.try_get_pending_op(&make_str(&env, "op-005")).is_err());
+    }
+
+    #[test]
+    fn test_set_timelock_delay() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        client.set_timelock_delay(&admin, &3600_u64).unwrap();
+        assert!(client.try_set_timelock_delay(&admin, &0_u64).is_err());
+    }
+
+    #[test]
+    fn test_unauthorized_propose_fails() {
+        let (env, admin, oracle, verifier) = setup();
+        let contract_id = env.register_contract(None, CarbonRegistryContract);
+        let client = CarbonRegistryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &vec![&env, verifier.clone()]).unwrap();
+        register(&env, &client, &admin);
+        let rogue = Address::generate(&env);
+        assert!(client.try_propose_suspend_project(
+            &rogue, &make_str(&env, "op-bad"), &make_str(&env, "proj-001"), &make_str(&env, "hack"),
+        ).is_err());
     }
 }
