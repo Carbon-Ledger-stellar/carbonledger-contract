@@ -24,3 +24,9 @@ Cargo.lock
 *.o
 *.so
 *.dylib
+
+# soroban-sdk writes a JSON snapshot of the end-state Env for every #[test]
+# that constructs an Env. They are large, regenerate on every run, and nothing
+# here reviews them as golden files — so they only ever show up as noise in
+# `git status`. Delete this rule if snapshot diffing is ever wired into review.
+test_snapshots/

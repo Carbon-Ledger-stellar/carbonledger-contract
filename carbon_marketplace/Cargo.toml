@@ -6,6 +6,12 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Opt-in only. Emits the ContractFunctionSet impl and test clients so that
+# other crates (carbon_fuzz) can register this contract in a test Env.
+# Never enabled for the wasm release build.
+testutils = ["soroban-sdk/testutils"]
+
 [dependencies]
 soroban-sdk = { version = "20.0.0", features = ["alloc"] }
 

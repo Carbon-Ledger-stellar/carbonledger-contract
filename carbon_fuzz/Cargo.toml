@@ -1,0 +1,15 @@
+[package]
+name = "carbon_fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The harness lives entirely in tests/. The contracts are dev-dependencies so
+# that their `testutils` feature can never be unified into the wasm release
+# build of the contracts themselves.
+[dev-dependencies]
+soroban-sdk = { version = "20.0.0", features = ["testutils", "alloc"] }
+carbon_registry = { path = "../carbon_registry", features = ["testutils"] }
+carbon_credit = { path = "../carbon_credit", features = ["testutils"] }
+carbon_marketplace = { path = "../carbon_marketplace", features = ["testutils"] }
+carbon_oracle = { path = "../carbon_oracle", features = ["testutils"] }
